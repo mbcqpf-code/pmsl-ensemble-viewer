@@ -21,7 +21,7 @@ from herbie import Herbie
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 1. CONFIGURATION & DOMAIN SETUP
+# 1. DOMAIN CONFIGURATION & DIRECTORIES
 # ==============================================================================
 OUTPUT_DIR = "pmsl_output"
 DATA_DIR = os.path.join(OUTPUT_DIR, "data")
@@ -29,12 +29,9 @@ SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(SPREAD_DIR, exist_ok=True)
 
-# Forecast leads: 0 to 240 hours every 12 hours
+# 0 to 240 hours every 12 hours (21 lead times)
 FXX_STEPS = list(range(0, 241, 12))
-
-# Standard meteorological MSLP isobars (4 hPa intervals)
 PMSL_CONTOURS = list(range(960, 1052, 4))
-
 CANVAS_W, CANVAS_H = 1200, 800
 
 http_session = requests.Session()
@@ -44,7 +41,6 @@ http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 http_session.headers.update({"User-Agent": "Mozilla/5.0 (PMSL-Viewer; Operational Met Research)"})
 
-# 0.5-degree synoptic CONUS grid
 lon_min, lon_max = -130.0, -60.0
 lat_min, lat_max = 20.0, 55.0
 grid_lats = np.arange(lat_min, lat_max + 0.5, 0.5)
@@ -53,7 +49,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. CYCLE DETECTION & BASEMAP INITIALIZATION
+# 2. CYCLE DETECTOR (MONITORING IFS & AIGEFS SFC AT F240)
 # ==============================================================================
 def detect_latest_complete_cycle():
     now = datetime.utcnow()
@@ -64,15 +60,45 @@ def detect_latest_complete_cycle():
     print("🔍 Probing for newest complete 240h ensemble cycle...")
     for cand in candidates:
         cycle_str = cand.strftime('%Y-%m-%d %H:00')
-        print(f"  • Checking cycle: {cycle_str}Z...")
+        print(f"  • Checking candidate cycle: {cycle_str}Z...")
+        
+        ifs_ready = False
         try:
             H_ifs = Herbie(cycle_str, model="ifs", product="enfo", fxx=240)
             if H_ifs.grib is not None:
-                print(f"🎯 Target Cycle Verified: {cycle_str}Z\n")
-                return cycle_str
+                ifs_ready = True
         except Exception:
+            pass
+
+        if not ifs_ready:
             continue
-    return candidates[1].strftime('%Y-%m-%d %H:00')
+
+        aigefs_ready = False
+        date_nomads = cand.strftime('%Y%m%d')
+        cycle_nomads = cand.strftime('%H')
+        url_aigefs_sfc = (
+            f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/"
+            f"aigefs.{date_nomads}/{cycle_nomads}/mem000/model/atmos/grib2/"
+            f"aigefs.t{cycle_nomads}z.sfc.f240.grib2.idx"
+        )
+        try:
+            resp = http_session.head(url_aigefs_sfc, timeout=5)
+            if resp.status_code == 200:
+                aigefs_ready = True
+            else:
+                H_ai = Herbie(cycle_str, model="aigefs", product="sfc", member="mem000", fxx=240)
+                if H_ai.grib is not None:
+                    aigefs_ready = True
+        except Exception:
+            pass
+
+        if ifs_ready and aigefs_ready:
+            print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
+            return cycle_str
+
+    fallback_str = candidates[1].strftime('%Y-%m-%d %H:00')
+    print(f"⚠️ Falling back to verified baseline: {fallback_str}Z\n")
+    return fallback_str
 
 global_init_time = detect_latest_complete_cycle()
 
@@ -93,10 +119,9 @@ geo_trans = ccrs.PlateCarree()._as_mpl_transform(ax)
 
 
 # ==============================================================================
-# 3. GRID STANDARDIZATION & VECTOR EXTRACTION
+# 3. GRID STANDARDIZATION & ISOBAR EXTRACTION
 # ==============================================================================
 def standardize_pmsl_grid(ds):
-    """Interpolates to standard grid and converts Pascals to hPa."""
     if ds is None:
         return None
     if isinstance(ds, list):
@@ -112,15 +137,13 @@ def standardize_pmsl_grid(ds):
         da = da.sortby(['latitude', 'longitude'])
         da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
         arr = da_interp.values
-        # GRIB sea level pressure is typically stored in Pa (~101325 Pa)
         if np.nanmean(arr) > 2000:
-            arr = arr / 100.0
+            arr = arr / 100.0  # Convert Pa -> hPa
         return arr
     except Exception:
         return None
 
 def extract_contours(grid):
-    """Extracts vector isobars transformed to screen pixel coordinates."""
     if grid is None or np.all(np.isnan(grid)):
         return {}
     try:
@@ -155,42 +178,32 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 4. EXTREMA DETECTION & OBJECT-BASED MEDIAN CLUSTERING
+# 4. EXTREMA EXTRACTION & MEDIAN CLUSTERING
 # ==============================================================================
 def detect_member_centers(grid):
-    """
-    Identifies local Lows and Highs using spatial neighborhood filters.
-    Returns pixel coordinates and 2-digit pressure labels matching Tropical Tidbits.
-    """
     if grid is None or np.all(np.isnan(grid)):
         return {"lows": [], "highs": []}
     
-    # 9x9 neighborhood (~4.5 deg x 4.5 deg ~ 450 km)
-    window = 9
+    window = 9  # ~4.5 degrees radius
     min_flt = minimum_filter(grid, size=window, mode='nearest')
     max_flt = maximum_filter(grid, size=window, mode='nearest')
     
     low_mask = (grid == min_flt) & (grid < 1020.0)
     high_mask = (grid == max_flt) & (grid > 1012.0)
     
-    # Exclude boundary margins (5 grid cells)
     low_mask[:5, :] = low_mask[-5:, :] = low_mask[:, :5] = low_mask[:, -5:] = False
     high_mask[:5, :] = high_mask[-5:, :] = high_mask[:, :5] = high_mask[:, -5:] = False
     
-    lows = []
-    highs = []
-    
+    lows, highs = [], []
     for r, c in zip(*np.where(low_mask)):
         lat, lon = grid_lats[r], grid_lons[c]
         disp_pt = geo_trans.transform(np.array([[lon, lat]]))
         fig_pt = fig.transFigure.inverted().transform(disp_pt)[0]
         px = int(round(fig_pt[0] * CANVAS_W))
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
-        
         if 0 <= px <= CANVAS_W and 0 <= py <= CANVAS_H:
             p_val = float(grid[r, c])
-            lbl = f"{int(round(p_val)) % 100:02d}"
-            lows.append({"x": px, "y": py, "val": round(p_val, 1), "lbl": lbl, "lat": float(lat), "lon": float(lon)})
+            lows.append({"x": px, "y": py, "val": round(p_val, 1), "lbl": f"{int(round(p_val)) % 100:02d}", "lat": float(lat), "lon": float(lon)})
             
     for r, c in zip(*np.where(high_mask)):
         lat, lon = grid_lats[r], grid_lons[c]
@@ -198,19 +211,13 @@ def detect_member_centers(grid):
         fig_pt = fig.transFigure.inverted().transform(disp_pt)[0]
         px = int(round(fig_pt[0] * CANVAS_W))
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
-        
         if 0 <= px <= CANVAS_W and 0 <= py <= CANVAS_H:
             p_val = float(grid[r, c])
-            lbl = f"{int(round(p_val)) % 100:02d}"
-            highs.append({"x": px, "y": py, "val": round(p_val, 1), "lbl": lbl, "lat": float(lat), "lon": float(lon)})
+            highs.append({"x": px, "y": py, "val": round(p_val, 1), "lbl": f"{int(round(p_val)) % 100:02d}", "lat": float(lat), "lon": float(lon)})
             
     return {"lows": lows, "highs": highs}
 
 def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=450.0):
-    """
-    Clusters individual member centers using spatial graph grouping.
-    Calculates median central pressure, coordinates, and member support percentage.
-    """
     all_centers = []
     for m_idx, centers in enumerate(member_extrema_list):
         for pt in centers.get(center_type, []):
@@ -233,9 +240,8 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
             continue
         cluster = [all_centers[i]]
         visited[i] = True
-        
-        # Spatial breadth-first expansion
         queue = [all_centers[i]]
+        
         while queue:
             curr = queue.pop(0)
             for j in range(n):
@@ -246,12 +252,10 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
                         cluster.append(all_centers[j])
                         queue.append(all_centers[j])
                         
-        # Ensure distinct members per cluster
         member_ids = set(item["member"] for item in cluster)
         support_count = len(member_ids)
         support_pct = (support_count / total_members) * 100.0 if total_members > 0 else 0
         
-        # Aggregate stats
         pressures = [item["val"] for item in cluster]
         med_p = float(np.median(pressures))
         med_lat = float(np.median([item["lat"] for item in cluster]))
@@ -283,7 +287,7 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
 
 
 # ==============================================================================
-# 5. DATA INGESTION (PMSL WORKERS)
+# 5. DATA INGESTION (UPDATED TO SCN 25-89 SFC SPECIFICATIONS)
 # ==============================================================================
 def fetch_gefs_pmsl(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
@@ -304,22 +308,63 @@ def fetch_gefs_pmsl(fxx):
                 grids.append(res)
     return grids
 
-def fetch_aigefs_pmsl(fxx):
-    members = [f"mem{str(i).zfill(3)}" for i in range(31)]
-    def _worker(m):
-        for var in [":PRMSL:mean sea level:", ":PRES:mean sea level:"]:
-            try:
-                H = Herbie(global_init_time, model="aigefs", product="pres", member=m, fxx=fxx)
-                grid = standardize_pmsl_grid(H.xarray(var))
-                if grid is not None and grid.ndim == 2:
-                    return grid
-            except Exception:
-                continue
+def fetch_aigefs_direct_http(date_str, cycle_str, member_str, fxx):
+    fxx_str = f"f{fxx:03d}"
+    url_base = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.{date_str}/{cycle_str}/{member_str}/model/atmos/grib2/"
+    fname = f"aigefs.t{cycle_str}z.sfc.{fxx_str}.grib2"
+    try:
+        r_idx = http_session.get(f"{url_base}{fname}.idx", timeout=8)
+        if r_idx.status_code != 200:
+            return None
+        idx_lines = r_idx.text.splitlines()
+        target_idx = None
+        for i, line in enumerate(idx_lines):
+            if ":PRMSL:mean sea level:" in line:
+                target_idx = i
+                break
+        if target_idx is None:
+            return None
+            
+        start_byte = int(idx_lines[target_idx].split(':')[1])
+        end_byte = int(idx_lines[target_idx + 1].split(':')[1]) - 1 if target_idx + 1 < len(idx_lines) else ""
+        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+        
+        resp = http_session.get(f"{url_base}{fname}", headers=headers, timeout=12)
+        if resp.status_code not in [200, 206]:
+            return None
+            
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
+            tmp.write(resp.content)
+            tmp_path = tmp.name
+            
+        ds = xr.open_dataset(tmp_path, engine="cfgrib")
+        grid = standardize_pmsl_grid(ds)
+        ds.close()
+        os.remove(tmp_path)
+        return grid
+    except Exception:
         return None
+
+def fetch_aigefs_pmsl(fxx):
+    date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
+    date_str = date_dt.strftime('%Y%m%d')
+    cycle_str = date_dt.strftime('%H')
+    members = [f"mem{str(i).zfill(3)}" for i in range(31)]
+    
+    def _worker(m_str):
+        try:
+            H = Herbie(global_init_time, model="aigefs", product="sfc", member=m_str, fxx=fxx, source="nomads")
+            grid = standardize_pmsl_grid(H.xarray(":PRMSL:mean sea level:"))
+            if grid is not None and grid.ndim == 2:
+                return grid
+        except Exception:
+            pass
+        return fetch_aigefs_direct_http(date_str, cycle_str, m_str, fxx)
+
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None:
+            if res is not None and res.ndim == 2:
                 grids.append(res)
     return grids
 
@@ -371,6 +416,49 @@ def fetch_aifs_pmsl(fxx):
         pass
     return grids
 
+def fetch_aigfs_pmsl(fxx):
+    date_dt = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M')
+    date_str = date_dt.strftime('%Y%m%d')
+    cycle_str = date_dt.strftime('%H')
+    fxx_str = f"f{fxx:03d}"
+    
+    try:
+        H = Herbie(global_init_time, model="aigfs", product="sfc", fxx=fxx, source="nomads")
+        grid = standardize_pmsl_grid(H.xarray(":PRMSL:mean sea level:"))
+        if grid is not None and grid.ndim == 2:
+            return grid
+    except Exception:
+        pass
+        
+    url_base = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod/aigfs.{date_str}/{cycle_str}/model/atmos/grib2/"
+    fname = f"aigfs.t{cycle_str}z.sfc.{fxx_str}.grib2"
+    try:
+        r_idx = http_session.get(f"{url_base}{fname}.idx", timeout=8)
+        if r_idx.status_code == 200:
+            idx_lines = r_idx.text.splitlines()
+            target_idx = None
+            for i, line in enumerate(idx_lines):
+                if ":PRMSL:mean sea level:" in line:
+                    target_idx = i
+                    break
+            if target_idx is not None:
+                start_byte = int(idx_lines[target_idx].split(':')[1])
+                end_byte = int(idx_lines[target_idx + 1].split(':')[1]) - 1 if target_idx + 1 < len(idx_lines) else ""
+                headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+                resp = http_session.get(f"{url_base}{fname}", headers=headers, timeout=12)
+                if resp.status_code in [200, 206]:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
+                        tmp.write(resp.content)
+                        tmp_path = tmp.name
+                    ds = xr.open_dataset(tmp_path, engine="cfgrib")
+                    grid = standardize_pmsl_grid(ds)
+                    ds.close()
+                    os.remove(tmp_path)
+                    return grid
+    except Exception:
+        pass
+    return None
+
 def fetch_det_pmsl(model_name, product, search_str, fxx):
     try:
         H = Herbie(global_init_time, model=model_name, product=product, fxx=fxx)
@@ -386,9 +474,9 @@ def fetch_det_pmsl(model_name, product, search_str, fxx):
 
 
 # ==============================================================================
-# 6. SPREAD ENGINE (MSLP STANDARD DEVIATION)
+# 6. ENSEMBLE SPREAD UNDERLAYS
 # ==============================================================================
-PMSL_SPREAD_LEVELS = np.arange(1.0, 13.0, 1.0)  # 1 hPa to 12 hPa
+PMSL_SPREAD_LEVELS = np.arange(1.0, 13.0, 1.0)
 SPREAD_CMAP = plt.cm.YlOrRd
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
@@ -441,13 +529,13 @@ def render_spread_underlay(spread_grid, filename):
 
 
 # ==============================================================================
-# 7. BATCH EXECUTION LOOP
+# 7. BATCH EXTRACTION & PROCESSING LOOP
 # ==============================================================================
 for fxx in FXX_STEPS:
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing PMSL Lead F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    # 1. Fetch ensembles
+    # Ingest ensembles
     gefs_mems   = fetch_gefs_pmsl(fxx)
     aigefs_mems = fetch_aigefs_pmsl(fxx)
     ifs_mems    = fetch_ifs_pmsl(fxx)
@@ -456,32 +544,41 @@ for fxx in FXX_STEPS:
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     print(f"  ↳ Members loaded: GEFS={len(gefs_mems)}, AIGEFS={len(aigefs_mems)}, IFS={len(ifs_mems)}, AIFS={len(aifs_mems)} (Total: {len(all_members)})")
 
-    # 2. Compute means
+    # Ingest deterministics
+    det_gfs   = fetch_det_pmsl("gfs", "pgrb2.0p25", ":PRMSL:mean sea level:", fxx)
+    det_aigfs = fetch_aigfs_pmsl(fxx)
+    det_ifs   = fetch_det_pmsl("ifs", "oper", ":msl:", fxx)
+    det_aifs  = fetch_det_pmsl("aifs", "oper", ":msl:", fxx)
+
+    # Compute means
     gefs_mean   = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
     aigefs_mean = np.mean(np.stack(aigefs_mems), axis=0) if aigefs_mems else None
     ifs_mean    = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
     aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # 3. Spread underlays
+    # Render spread underlays
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
             render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png")
 
-    # 4. Fetch deterministics
-    det_gfs  = fetch_det_pmsl("gfs", "pgrb2.0p25", ":PRMSL:mean sea level:", fxx)
-    det_ifs  = fetch_det_pmsl("ifs", "oper", ":msl:", fxx)
-    det_aifs = fetch_det_pmsl("aifs", "oper", ":msl:", fxx)
-
-    # 5. Detect member Low/High centers
+    # Detect centers for all members
     gefs_extrema   = [detect_member_centers(m) for m in gefs_mems]
     aigefs_extrema = [detect_member_centers(m) for m in aigefs_mems]
     ifs_extrema    = [detect_member_centers(m) for m in ifs_mems]
     aifs_extrema   = [detect_member_centers(m) for m in aifs_mems]
     all_extrema    = gefs_extrema + aigefs_extrema + ifs_extrema + aifs_extrema
 
-    # 6. Object-based median clusters
+    # Detect centers for deterministics
+    det_extrema = {
+        "gfs": detect_member_centers(det_gfs),
+        "aigfs": detect_member_centers(det_aigfs),
+        "ifs": detect_member_centers(det_ifs),
+        "aifs": detect_member_centers(det_aifs)
+    }
+
+    # Group median clusters
     total_mem_count = len(all_members)
     median_low_clusters  = cluster_extrema_medians(all_extrema, total_mem_count, center_type="lows")
     median_high_clusters = cluster_extrema_medians(all_extrema, total_mem_count, center_type="highs")
@@ -497,12 +594,14 @@ for fxx in FXX_STEPS:
         "ifs_mean": extract_contours(ifs_mean),
         "aifs_mean": extract_contours(aifs_mean),
         "gfs_det": extract_contours(det_gfs),
+        "aigfs_det": extract_contours(det_aigfs),
         "ifs_det": extract_contours(det_ifs),
         "aifs_det": extract_contours(det_aifs),
         "gefs_extrema": gefs_extrema,
         "aigefs_extrema": aigefs_extrema,
         "ifs_extrema": ifs_extrema,
         "aifs_extrema": aifs_extrema,
+        "det_extrema": det_extrema,
         "median_lows": median_low_clusters,
         "median_highs": median_high_clusters
     }
@@ -514,7 +613,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. DYNAMIC FRONTEND GENERATION
+# 8. FRONTEND (CANVAS RENDERING, PAN/ZOOM, TOOLTIPS & DET CENTERS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -551,7 +650,6 @@ html_content = f"""<!DOCTYPE html>
     }}
     .btn:hover {{ filter: brightness(1.15); }}
     .btn-secondary {{ background: #475569; }}
-    .btn-micro {{ background: #334155; padding: 2px 6px; font-size: 11px; border-radius: 4px; }}
     select {{
       padding: 5px 9px; border-radius: 6px; background: #0f172a; color: white;
       border: 1px solid var(--border); font-size: 13px;
@@ -561,16 +659,21 @@ html_content = f"""<!DOCTYPE html>
       border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 8px;
     }}
     .group-line {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }}
-    .group-label {{ font-weight: bold; min-width: 140px; display: flex; align-items: center; gap: 6px; }}
+    .group-label {{ font-weight: bold; min-width: 155px; display: flex; align-items: center; gap: 6px; }}
     .checkbox-item {{ display: flex; align-items: center; gap: 5px; cursor: pointer; }}
     .swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
+    
+    .badge-tag {{
+      display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 11px; font-weight: bold;
+    }}
 
     .viewer-card {{
       position: relative; width: 100%; max-width: 1200px; aspect-ratio: 1200 / 800;
       background: #000; border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+      cursor: grab; user-select: none;
     }}
-    .viewer-card img, .viewer-card canvas {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; }}
-    #contourCanvas {{ pointer-events: none; }}
+    .viewer-card:active {{ cursor: grabbing; }}
+    #contourCanvas {{ width: 100%; height: 100%; display: block; }}
     
     .legend-box {{
       position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
@@ -583,6 +686,28 @@ html_content = f"""<!DOCTYPE html>
       color: #111; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: bold;
       pointer-events: none; line-height: 1.3;
     }}
+    
+    .zoom-controls {{
+      position: absolute; bottom: 14px; right: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 10;
+    }}
+    .zoom-btn {{
+      background: rgba(30, 41, 59, 0.92); color: white; border: 1px solid var(--border);
+      width: 32px; height: 32px; border-radius: 6px; font-size: 16px; font-weight: bold;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3); transition: 0.15s;
+    }}
+    .zoom-btn:hover {{ background: #3b82f6; }}
+    .zoom-indicator {{
+      background: rgba(15, 23, 42, 0.85); color: #cbd5e1; font-size: 10px;
+      padding: 2px 4px; border-radius: 4px; text-align: center; border: 1px solid var(--border);
+    }}
+
+    .hover-tooltip {{
+      position: fixed; display: none; pointer-events: none; z-index: 1000;
+      background: rgba(15, 23, 42, 0.95); border: 1px solid #3b82f6; color: white;
+      padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+      box-shadow: 0 6px 20px rgba(0,0,0,0.6); max-width: 280px;
+    }}
     .spread-colorbar {{ display: none; align-items: center; gap: 8px; font-size: 11px; }}
     .colorbar-gradient {{
       width: 120px; height: 10px; border-radius: 3px;
@@ -594,8 +719,8 @@ html_content = f"""<!DOCTYPE html>
 <body>
 
   <div class="header">
-    <h2>PMSL Multi-Ensemble & Pressure Extrema Viewer</h2>
-    <div class="subtitle">Cycle: {global_init_time}Z | Tropical Tidbits Extrema & Object-Based Medians</div>
+    <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
+    <div class="subtitle">Cycle: {global_init_time}Z | Interactive Deep Zoom & Deterministic Overlays</div>
   </div>
 
   <div class="toolbar">
@@ -628,10 +753,10 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 2: Ensemble Isobars & Deterministics -->
+    <!-- Row 2: Isobars -->
     <div class="panel-box">
       <div class="group-line">
-        <span class="group-label">Isobars (Mean):</span>
+        <span class="group-label">Isobars (Mean & Det):</span>
         <label class="checkbox-item"><input type="checkbox" id="chk_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super Mean</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_gefs_mean" checked onchange="draw()"><span class="swatch" style="background:#0044ff;"></span> GEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigefs_mean" checked onchange="draw()"><span class="swatch" style="background:#8e44ad;"></span> AIGEFS</label>
@@ -639,11 +764,12 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_mean" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
         <span style="border-left: 1px solid var(--border); height: 16px; margin: 0 4px;"></span>
         <label class="checkbox-item"><input type="checkbox" id="chk_gfs_det" onchange="draw()"> GFS Det</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_aigfs_det" onchange="draw()"> AIGFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs_det" onchange="draw()"> IFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"> AIFS Det</label>
       </div>
 
-      <!-- Row 3: Member Centers (Tropical Tidbits Style) -->
+      <!-- Row 3: Member Centers -->
       <div class="group-line">
         <span class="group-label">Member Centers:</span>
         <label class="checkbox-item"><input type="checkbox" id="chk_show_lows" checked onchange="draw()"><span style="color:#e74c3c; font-weight:bold;">Lows (Red)</span></label>
@@ -655,7 +781,16 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_centers" checked onchange="draw()"> AIFS</label>
       </div>
 
-      <!-- Row 4: Median Clusters (Anti-Washout Engine) -->
+      <!-- Row 4: Deterministic Centers -->
+      <div class="group-line">
+        <span class="group-label">Deterministic Centers:</span>
+        <label class="checkbox-item"><input type="checkbox" id="chk_det_gfs" checked onchange="draw()"><span class="badge-tag" style="background:#001155; color:#fff;">GFS</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_det_aigfs" checked onchange="draw()"><span class="badge-tag" style="background:#4a235a; color:#fff;">AIGFS</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_det_ifs" checked onchange="draw()"><span class="badge-tag" style="background:#78281f; color:#fff;">IFS</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_det_aifs" checked onchange="draw()"><span class="badge-tag" style="background:#145a32; color:#fff;">AIFS</span></label>
+      </div>
+
+      <!-- Row 5: Object-Based Medians -->
       <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 4px 8px; border-radius: 6px;">
         <span class="group-label">Ensemble Median:</span>
         <label class="checkbox-item"><input type="checkbox" id="chk_median_lows" checked onchange="draw()"> <b>Plot Median Lows</b></label>
@@ -663,9 +798,9 @@ html_content = f"""<!DOCTYPE html>
         <span style="display: flex; align-items: center; gap: 6px; margin-left: 10px;">
           <span>Min Consensus:</span>
           <select id="minPctSelect" onchange="draw()">
-            <option value="15">≥ 15% of members</option>
-            <option value="20" selected>≥ 20% of members</option>
-            <option value="30">≥ 30% of members</option>
+            <option value="15">≥ 15%</option>
+            <option value="20" selected>≥ 20%</option>
+            <option value="30">≥ 30%</option>
             <option value="50">≥ 50% (High Confidence)</option>
           </select>
         </span>
@@ -673,8 +808,7 @@ html_content = f"""<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="viewer-card">
-    <img id="mapUnderlay" src="basemap.png" alt="Basemap">
+  <div class="viewer-card" id="viewerCard">
     <canvas id="contourCanvas" width="1200" height="800"></canvas>
     
     <div class="title-stamp" id="mapTitleStamp">
@@ -682,23 +816,50 @@ html_content = f"""<!DOCTYPE html>
     </div>
 
     <div class="legend-box" id="legendBox"></div>
+
+    <div class="zoom-controls">
+      <button class="zoom-btn" onclick="zoomDelta(1.3)" title="Zoom In">+</button>
+      <button class="zoom-btn" onclick="zoomDelta(0.77)" title="Zoom Out">−</button>
+      <button class="zoom-btn" onclick="resetZoom()" title="Reset / Fit CONUS" style="font-size:11px;">Fit</button>
+      <div class="zoom-indicator" id="zoomLevelText">1.0x</div>
+    </div>
   </div>
 
+  <div class="hover-tooltip" id="hoverTooltip"></div>
+
   <script>
+    const CANVAS_W = 1200;
+    const CANVAS_H = 800;
     let dataCache = {{}};
     let currentStepData = null;
+    let underlayImg = new Image();
+    underlayImg.src = 'basemap.png';
+
+    // Pan & Zoom State
+    let zoom = 1.0;
+    let panX = 0;
+    let panY = 0;
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+
+    const card = document.getElementById('viewerCard');
+    const canvas = document.getElementById('contourCanvas');
+    const ctx = canvas.getContext('2d');
+    const tooltip = document.getElementById('hoverTooltip');
+
+    underlayImg.onload = () => draw();
 
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
-      const img = document.getElementById('mapUnderlay');
       const cbar = document.getElementById('cbarBox');
 
       if (bg === 'none') {{
-        img.src = 'basemap.png';
+        underlayImg.src = 'basemap.png';
         cbar.style.display = 'none';
       }} else {{
-        img.src = `spread/${{bg}}_f${{fxx}}.png`;
+        underlayImg.src = `spread/${{bg}}_f${{fxx}}.png`;
         cbar.style.display = 'flex';
       }}
     }}
@@ -736,11 +897,152 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowRight') step(1);
     }});
 
+    // =========================================================================
+    // PAN & ZOOM LOGIC
+    // =========================================================================
+    function clampPan() {{
+      const minX = CANVAS_W * (1 - zoom);
+      const minY = CANVAS_H * (1 - zoom);
+      panX = Math.min(0, Math.max(minX, panX));
+      panY = Math.min(0, Math.max(minY, panY));
+    }}
+
+    function zoomAt(mx, my, factor) {{
+      const oldZoom = zoom;
+      zoom = Math.min(Math.max(1.0, zoom * factor), 6.0);
+      if (zoom === 1.0) {{
+        panX = 0; panY = 0;
+      }} else {{
+        panX = mx - (mx - panX) * (zoom / oldZoom);
+        panY = my - (my - panY) * (zoom / oldZoom);
+        clampPan();
+      }}
+      document.getElementById('zoomLevelText').textContent = zoom.toFixed(1) + 'x';
+      draw();
+    }}
+
+    function zoomDelta(factor) {{
+      zoomAt(CANVAS_W / 2, CANVAS_H / 2, factor);
+    }}
+
+    function resetZoom() {{
+      zoom = 1.0;
+      panX = 0;
+      panY = 0;
+      document.getElementById('zoomLevelText').textContent = '1.0x';
+      draw();
+    }}
+
+    card.addEventListener('wheel', (e) => {{
+      e.preventDefault();
+      const rect = card.getBoundingClientRect();
+      const scaleX = CANVAS_W / rect.width;
+      const scaleY = CANVAS_H / rect.height;
+      const mx = (e.clientX - rect.left) * scaleX;
+      const my = (e.clientY - rect.top) * scaleY;
+      zoomAt(mx, my, e.deltaY < 0 ? 1.18 : 0.85);
+    }}, {{ passive: false }});
+
+    card.addEventListener('mousedown', (e) => {{
+      if (zoom <= 1.0) return;
+      isDragging = true;
+      const rect = card.getBoundingClientRect();
+      const scaleX = CANVAS_W / rect.width;
+      const scaleY = CANVAS_H / rect.height;
+      startX = (e.clientX - rect.left) * scaleX - panX;
+      startY = (e.clientY - rect.top) * scaleY - panY;
+    }});
+
+    window.addEventListener('mousemove', (e) => {{
+      if (isDragging) {{
+        const rect = card.getBoundingClientRect();
+        const scaleX = CANVAS_W / rect.width;
+        const scaleY = CANVAS_H / rect.height;
+        panX = (e.clientX - rect.left) * scaleX - startX;
+        panY = (e.clientY - rect.top) * scaleY - startY;
+        clampPan();
+        draw();
+      }}
+      handleHoverInspection(e);
+    }});
+
+    window.addEventListener('mouseup', () => {{ isDragging = false; }});
+
+    // =========================================================================
+    // HOVER CLUSTER INSPECTION TOOLTIP
+    // =========================================================================
+    function handleHoverInspection(e) {{
+      if (!currentStepData) return;
+      const rect = card.getBoundingClientRect();
+      if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {{
+        tooltip.style.display = 'none';
+        return;
+      }}
+      const scaleX = CANVAS_W / rect.width;
+      const scaleY = CANVAS_H / rect.height;
+      const mx = (e.clientX - rect.left) * scaleX;
+      const my = (e.clientY - rect.top) * scaleY;
+
+      // Coordinate in map space
+      const mapX = (mx - panX) / zoom;
+      const mapY = (my - panY) / zoom;
+      const searchRadius = 24 / zoom;
+
+      const nearbyLows = [];
+      function gather(ensList, label) {{
+        if (!ensList) return;
+        ensList.forEach(m => {{
+          m.lows.forEach(pt => {{
+            const dist = Math.hypot(pt.x - mapX, pt.y - mapY);
+            if (dist <= searchRadius) nearbyLows.push({{ ...pt, suite: label }});
+          }});
+        }});
+      }}
+
+      gather(currentStepData.gefs_extrema, "GEFS");
+      gather(currentStepData.aigefs_extrema, "AIGEFS");
+      gather(currentStepData.ifs_extrema, "IFS");
+      gather(currentStepData.aifs_extrema, "AIFS");
+
+      if (nearbyLows.length >= 3) {{
+        const pressures = nearbyLows.map(p => p.val).sort((a,b) => a - b);
+        const minP = pressures[0];
+        const maxP = pressures[pressures.length - 1];
+        const medP = pressures[Math.floor(pressures.length / 2)];
+        
+        tooltip.innerHTML = `
+          <b>Local Low Cluster</b> (${{nearbyLows.length}} members)<br>
+          <b>Median:</b> ${{medP}} hPa | <b>Range:</b> ${{minP}} - ${{maxP}} hPa<br>
+          <div style="font-size:11px; color:#94a3b8; margin-top:4px;">
+            GEFS: ${{nearbyLows.filter(p=>p.suite==='GEFS').length}} | 
+            AIGEFS: ${{nearbyLows.filter(p=>p.suite==='AIGEFS').length}} | 
+            IFS: ${{nearbyLows.filter(p=>p.suite==='IFS').length}} | 
+            AIFS: ${{nearbyLows.filter(p=>p.suite==='AIFS').length}}
+          </div>
+        `;
+        tooltip.style.left = (e.clientX + 14) + 'px';
+        tooltip.style.top = (e.clientY + 14) + 'px';
+        tooltip.style.display = 'block';
+      }} else {{
+        tooltip.style.display = 'none';
+      }}
+    }}
+
+    // =========================================================================
+    // RENDERING ENGINE
+    // =========================================================================
     function draw() {{
       if (!currentStepData) return;
-      const canvas = document.getElementById('contourCanvas');
-      const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+      ctx.save();
+      ctx.translate(panX, panY);
+      ctx.scale(zoom, zoom);
+
+      // 1. Draw Underlay
+      if (underlayImg.complete && underlayImg.naturalWidth !== 0) {{
+        ctx.drawImage(underlayImg, 0, 0, CANVAS_W, CANVAS_H);
+      }}
 
       document.getElementById('mapTitleStamp').innerHTML = 
         `PMSL (hPa) | Lead: F${{String(currentStepData.fxx).padStart(3, '0')}}<br>` +
@@ -748,12 +1050,11 @@ html_content = f"""<!DOCTYPE html>
 
       const legendItems = [];
 
-      // 1. Draw Isobars
       function drawLines(layerDict, color, width, dashed = false) {{
         if (!layerDict) return;
         ctx.strokeStyle = color;
-        ctx.lineWidth = width;
-        ctx.setLineDash(dashed ? [6, 4] : []);
+        ctx.lineWidth = width / Math.pow(zoom, 0.4);
+        ctx.setLineDash(dashed ? [6 / zoom, 4 / zoom] : []);
         ctx.globalAlpha = 1.0;
 
         for (const [lvl, lines] of Object.entries(layerDict)) {{
@@ -767,10 +1068,14 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // Deterministics
+      // Deterministic Isobars
       if (document.getElementById('chk_gfs_det').checked && currentStepData.gfs_det) {{
         drawLines(currentStepData.gfs_det, '#001155', 1.8, true);
         legendItems.push({{ label: 'GFS Det', color: '#001155', dash: true }});
+      }}
+      if (document.getElementById('chk_aigfs_det').checked && currentStepData.aigfs_det) {{
+        drawLines(currentStepData.aigfs_det, '#4a235a', 1.8, true);
+        legendItems.push({{ label: 'AIGFS Det', color: '#4a235a', dash: true }});
       }}
       if (document.getElementById('chk_ifs_det').checked && currentStepData.ifs_det) {{
         drawLines(currentStepData.ifs_det, '#78281f', 1.8, true);
@@ -781,7 +1086,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Det', color: '#145a32', dash: true }});
       }}
 
-      // Ensemble Means
+      // Ensemble Mean Isobars
       if (document.getElementById('chk_gefs_mean').checked && currentStepData.gefs_mean) {{
         drawLines(currentStepData.gefs_mean, '#0044ff', 2.2);
         legendItems.push({{ label: 'GEFS Mean', color: '#0044ff', dash: false }});
@@ -799,24 +1104,24 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // Superensemble Mean (Bold Black with Contour Labels)
+      // Superensemble Mean (Solid Black)
       if (document.getElementById('chk_super').checked && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
 
-        ctx.font = 'bold 10px sans-serif';
+        ctx.font = `bold ${{Math.round(10 / zoom)}}px sans-serif`;
         ctx.fillStyle = '#000';
         for (const [lvl, lines] of Object.entries(currentStepData.super_mean)) {{
           lines.forEach(pts => {{
             if (pts.length > 12) {{
               const mid = pts[Math.floor(pts.length / 2)];
-              ctx.fillText(lvl, mid[0] + 3, mid[1] - 3);
+              ctx.fillText(lvl, mid[0] + 3 / zoom, mid[1] - 3 / zoom);
             }}
           }});
         }}
       }}
 
-      // 2. Member Extrema Centers (Tropical Tidbits Style)
+      // 2. Member Extrema (Fixed Screen-Space Font Sizing to Unclutter on Zoom)
       const showLows = document.getElementById('chk_show_lows').checked;
       const showHighs = document.getElementById('chk_show_highs').checked;
       
@@ -826,7 +1131,7 @@ html_content = f"""<!DOCTYPE html>
       if (document.getElementById('chk_ifs_centers').checked) activeEnsembles.push(currentStepData.ifs_extrema);
       if (document.getElementById('chk_aifs_centers').checked) activeEnsembles.push(currentStepData.aifs_extrema);
 
-      ctx.font = 'bold 10px monospace';
+      ctx.font = `bold ${{Math.round(11 / zoom)}}px monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
 
@@ -834,17 +1139,55 @@ html_content = f"""<!DOCTYPE html>
         if (!ens) return;
         ens.forEach(member => {{
           if (showLows && member.lows) {{
-            ctx.fillStyle = '#e74c3c'; // Tropical Tidbits Red
+            ctx.fillStyle = '#e74c3c';
             member.lows.forEach(pt => ctx.fillText(pt.lbl, pt.x, pt.y));
           }}
           if (showHighs && member.highs) {{
-            ctx.fillStyle = '#2980b9'; // Tropical Tidbits Blue
+            ctx.fillStyle = '#2980b9';
             member.highs.forEach(pt => ctx.fillText(pt.lbl, pt.x, pt.y));
           }}
         }});
       }});
 
-      // 3. Object-Based Median Lows & Highs
+      // 3. Deterministic Centers (Rendered as Bold Boxed Badges)
+      const detConfigs = [
+        {{ key: 'gfs', chk: 'chk_det_gfs', color: '#001155', tag: 'GFS' }},
+        {{ key: 'aigfs', chk: 'chk_det_aigfs', color: '#4a235a', tag: 'AIGFS' }},
+        {{ key: 'ifs', chk: 'chk_det_ifs', color: '#78281f', tag: 'IFS' }},
+        {{ key: 'aifs', chk: 'chk_det_aifs', color: '#145a32', tag: 'AIFS' }}
+      ];
+
+      detConfigs.forEach(d => {{
+        if (!document.getElementById(d.chk).checked || !currentStepData.det_extrema) return;
+        const extrema = currentStepData.det_extrema[d.key];
+        if (!extrema) return;
+
+        function renderDetBadge(pts, isLow) {{
+          pts.forEach(pt => {{
+            const badgeW = 44 / zoom;
+            const badgeH = 18 / zoom;
+            const rx = pt.x - badgeW / 2;
+            const ry = pt.y - badgeH / 2;
+
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+            ctx.strokeStyle = d.color;
+            ctx.lineWidth = 2.0 / zoom;
+            ctx.beginPath();
+            ctx.roundRect(rx, ry, badgeW, badgeH, 4 / zoom);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.font = `bold ${{Math.round(9 / zoom)}}px sans-serif`;
+            ctx.fillStyle = isLow ? '#c0392b' : '#2471a3';
+            ctx.fillText(`${{d.tag}} ${{pt.lbl}}`, pt.x, pt.y);
+          }});
+        }}
+
+        if (showLows && extrema.lows) renderDetBadge(extrema.lows, true);
+        if (showHighs && extrema.highs) renderDetBadge(extrema.highs, false);
+      }});
+
+      // 4. Object-Based Median Lows & Highs
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
       const plotMedLows = document.getElementById('chk_median_lows').checked;
       const plotMedHighs = document.getElementById('chk_median_highs').checked;
@@ -852,33 +1195,29 @@ html_content = f"""<!DOCTYPE html>
       function renderClusterBadges(clusters, color) {{
         clusters.forEach(c => {{
           if (c.pct < minPct) return;
-          
-          // Outer halo
+          const r = 16 / zoom;
           ctx.beginPath();
-          ctx.arc(c.x, c.y, 16, 0, 2 * Math.PI);
+          ctx.arc(c.x, c.y, r, 0, 2 * Math.PI);
           ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
           ctx.fill();
-          ctx.lineWidth = 2.5;
+          ctx.lineWidth = 2.5 / zoom;
           ctx.strokeStyle = color;
           ctx.stroke();
 
-          // Value and consensus text
-          ctx.font = 'bold 11px sans-serif';
+          ctx.font = `bold ${{Math.round(11 / zoom)}}px sans-serif`;
           ctx.fillStyle = color;
-          ctx.fillText(c.median_p, c.x, c.y - 2);
+          ctx.fillText(c.median_p, c.x, c.y - 2 / zoom);
 
-          ctx.font = '8px sans-serif';
+          ctx.font = `${{Math.round(8 / zoom)}}px sans-serif`;
           ctx.fillStyle = '#333333';
-          ctx.fillText(`${{c.pct}}% (${{c.count}}/${{c.total_members}})`, c.x, c.y + 7);
+          ctx.fillText(`${{c.pct}}% (${{c.count}}/${{c.total_members}})`, c.x, c.y + 7 / zoom);
         }});
       }}
 
-      if (plotMedLows && currentStepData.median_lows) {{
-        renderClusterBadges(currentStepData.median_lows, '#c0392b');
-      }}
-      if (plotMedHighs && currentStepData.median_highs) {{
-        renderClusterBadges(currentStepData.median_highs, '#2471a3');
-      }}
+      if (plotMedLows && currentStepData.median_lows) renderClusterBadges(currentStepData.median_lows, '#c0392b');
+      if (plotMedHighs && currentStepData.median_highs) renderClusterBadges(currentStepData.median_highs, '#2471a3');
+
+      ctx.restore();
 
       // Dynamic Legend
       document.getElementById('legendBox').innerHTML = legendItems.map(item => `
