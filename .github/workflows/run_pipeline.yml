@@ -2,31 +2,37 @@ name: Generate and Deploy PMSL Ensembles
 
 on:
   schedule:
-    # Runs at 04:15Z and 16:15Z (after 00Z and 12Z IFS/AIGEFS cycles finish)
-    - cron: '15 4,16 * * *'
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+    # Runs twice daily at 04:30Z and 16:30Z (allows time for 00z/12z ECMWF IFS & AIGEFS runs to complete)
+    - cron: '30 4,16 * * *'
+  workflow_dispatch: # Enables manual "Run workflow" button in GitHub Actions UI
 
+# Set permissions for GitHub Pages deployment
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
 jobs:
-  build-and-deploy:
+  build-pmsl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6-hour GitHub Actions maximum limit
+    timeout-minutes: 360 # 6-hour runner limit
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install System Geospatial & GRIB Libraries
+      - name: Install System GRIB & Geospatial Libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y libeccodes-dev libgeos-dev libproj-dev
@@ -40,9 +46,21 @@ jobs:
         run: |
           python src/pmsl.py
 
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./pmsl_output
-          force_orphan: true
+          path: './pmsl_output'
+
+  deploy-pages:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build-pmsl
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
