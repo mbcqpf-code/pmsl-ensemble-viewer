@@ -49,7 +49,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. CYCLE DETECTOR (IFS & AIGEFS SFC AT F240)
+# 2. CYCLE DETECTOR (MONITORING IFS & AIGEFS SFC AT F240)
 # ==============================================================================
 def detect_latest_complete_cycle():
     now = datetime.utcnow()
@@ -181,7 +181,6 @@ def extract_contours(grid):
 # 4. EXTREMA EXTRACTION & DENSITY-SEEDED RADIAL CLUSTERING
 # ==============================================================================
 def detect_member_centers(grid):
-    """Identifies local Lows and Highs using 2D neighborhood filters."""
     if grid is None or np.all(np.isnan(grid)):
         return {"lows": [], "highs": []}
     
@@ -219,10 +218,6 @@ def detect_member_centers(grid):
     return {"lows": lows, "highs": highs}
 
 def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=350.0):
-    """
-    Groups member centers using density-seeded radial clustering.
-    Prevents single-linkage chaining along fronts, troughs, and elongated gradients.
-    """
     all_centers = []
     for m_idx, centers in enumerate(member_extrema_list):
         for pt in centers.get(center_type, []):
@@ -238,13 +233,12 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
 
     unassigned = list(all_centers)
     clusters = []
-    min_members = max(3, int(total_members * 0.10))  # Minimum 10% threshold
+    min_members = max(3, int(total_members * 0.10))
 
     while unassigned:
         best_seed = None
         max_unique_members = -1
         
-        # Identify the densest core of unique members
         for cand in unassigned:
             nearby = [p for p in unassigned if approx_dist_km(cand["lat"], cand["lon"], p["lat"], p["lon"]) <= radius_km]
             unique_count = len(set(p["member"] for p in nearby))
@@ -260,10 +254,8 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
         if max_unique_members < min_members or best_seed is None:
             break
 
-        # Radial extraction centered strictly on the seed
         cluster_pts = [p for p in unassigned if approx_dist_km(best_seed["lat"], best_seed["lon"], p["lat"], p["lon"]) <= radius_km]
 
-        # Deduplicate: each ensemble member contributes its deepest center within this cyclone
         member_dict = {}
         for p in cluster_pts:
             m = p["member"]
@@ -305,7 +297,6 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
             "pct": round(support_pct, 1)
         })
 
-        # Remove points belonging to this cluster from the candidate pool
         assigned_keys = set((p["lat"], p["lon"], p["member"]) for p in cluster_pts)
         unassigned = [p for p in unassigned if (p["lat"], p["lon"], p["member"]) not in assigned_keys]
 
@@ -390,7 +381,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None:
+            if res is not None and res.ndim == 2:
                 grids.append(res)
     return grids
 
@@ -632,7 +623,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. FRONTEND GENERATOR (SYNCED HOVER TOOLTIP & PAN/ZOOM)
+# 8. FRONTEND GENERATOR (ADAPTIVE VIEWPORT SIZING & BULK GROUP CONTROLS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -648,88 +639,99 @@ html_content = f"""<!DOCTYPE html>
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --accent: #3b82f6;
+      /* Dynamic viewport sizing: expands to monitor while preserving 3:2 aspect ratio */
+      --map-w: min(98vw, calc((100vh - 175px) * 1.5));
     }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column; align-items: center;
+      margin: 0; padding: 4px 10px 12px 10px; box-sizing: border-box;
+      background: var(--bg); color: var(--text);
+      display: flex; flex-direction: column; align-items: center; min-height: 100vh;
     }}
-    .header {{ width: 100%; max-width: 1250px; padding: 14px 20px 6px 20px; box-sizing: border-box; text-align: center; }}
-    .header h2 {{ margin: 0 0 4px 0; font-size: 1.35rem; }}
-    .header .subtitle {{ font-size: 0.85rem; color: var(--text-muted); }}
+    .header {{ width: 100%; max-width: var(--map-w); padding: 4px 6px; box-sizing: border-box; text-align: center; }}
+    .header h2 {{ margin: 0; font-size: 1.25rem; }}
+    .header .subtitle {{ font-size: 0.8rem; color: var(--text-muted); margin-top: 2px; }}
 
     .toolbar {{
-      width: 100%; max-width: 1250px; background: var(--card-bg); border: 1px solid var(--border);
-      border-radius: 10px; padding: 10px 16px; margin: 8px 0; box-sizing: border-box;
-      display: flex; flex-direction: column; gap: 10px;
+      width: 100%; max-width: var(--map-w); background: var(--card-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 6px 12px; margin: 4px 0 6px 0; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 6px;
     }}
-    .row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 12px; justify-content: space-between; }}
+    .row {{ display: flex; align-items: center; flex-wrap: wrap; gap: 10px; justify-content: space-between; }}
     .btn {{
-      background: var(--accent); color: white; border: none; padding: 5px 12px; border-radius: 5px;
-      cursor: pointer; font-size: 12px; font-weight: 600;
+      background: var(--accent); color: white; border: none; padding: 4px 10px; border-radius: 5px;
+      cursor: pointer; font-size: 12px; font-weight: 600; transition: filter 0.15s;
     }}
     .btn:hover {{ filter: brightness(1.15); }}
     .btn-secondary {{ background: #475569; }}
+    .btn-micro {{
+      background: #334155; color: #cbd5e1; border: 1px solid #475569; padding: 1px 6px;
+      font-size: 10px; font-weight: 600; border-radius: 4px; cursor: pointer; line-height: 1.2;
+    }}
+    .btn-micro:hover {{ background: #475569; color: white; }}
     select {{
-      padding: 5px 9px; border-radius: 6px; background: #0f172a; color: white;
-      border: 1px solid var(--border); font-size: 13px;
+      padding: 4px 8px; border-radius: 5px; background: #0f172a; color: white;
+      border: 1px solid var(--border); font-size: 12px;
     }}
     
     .panel-box {{
-      border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 8px;
+      border-top: 1px solid var(--border); padding-top: 6px; display: flex; flex-direction: column; gap: 6px;
     }}
-    .group-line {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }}
-    .group-label {{ font-weight: bold; min-width: 155px; display: flex; align-items: center; gap: 6px; }}
-    .checkbox-item {{ display: flex; align-items: center; gap: 5px; cursor: pointer; }}
-    .swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
+    .group-line {{ display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; font-size: 12.5px; }}
+    .group-label {{
+      font-weight: bold; min-width: 175px; display: flex; align-items: center; gap: 4px;
+    }}
+    .checkbox-item {{ display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }}
+    .swatch {{ width: 11px; height: 11px; border-radius: 2px; display: inline-block; }}
     
     .badge-tag {{
-      display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 11px; font-weight: bold;
+      display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10.5px; font-weight: bold;
     }}
 
     .viewer-card {{
-      position: relative; width: 100%; max-width: 1200px; aspect-ratio: 1200 / 800;
-      background: #000; border-radius: 10px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+      position: relative; width: 100%; max-width: var(--map-w); aspect-ratio: 1200 / 800;
+      background: #000; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 25px rgba(0,0,0,0.5);
       cursor: grab; user-select: none;
     }}
     .viewer-card:active {{ cursor: grabbing; }}
     #contourCanvas {{ width: 100%; height: 100%; display: block; }}
     
     .legend-box {{
-      position: absolute; top: 12px; right: 12px; background: rgba(255, 255, 255, 0.94);
-      color: #111; padding: 8px 12px; border-radius: 6px; font-size: 12px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 4px;
+      position: absolute; top: 10px; right: 10px; background: rgba(255, 255, 255, 0.94);
+      color: #111; padding: 6px 10px; border-radius: 6px; font-size: 11px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.25); display: flex; flex-direction: column; gap: 3px;
       pointer-events: none;
     }}
     .title-stamp {{
-      position: absolute; top: 12px; left: 12px; background: rgba(255, 255, 255, 0.94);
-      color: #111; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: bold;
+      position: absolute; top: 10px; left: 10px; background: rgba(255, 255, 255, 0.94);
+      color: #111; padding: 5px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;
       pointer-events: none; line-height: 1.3;
     }}
     
     .zoom-controls {{
-      position: absolute; bottom: 14px; right: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 10;
+      position: absolute; bottom: 12px; right: 12px; display: flex; flex-direction: column; gap: 5px; z-index: 10;
     }}
     .zoom-btn {{
       background: rgba(30, 41, 59, 0.92); color: white; border: 1px solid var(--border);
-      width: 32px; height: 32px; border-radius: 6px; font-size: 16px; font-weight: bold;
+      width: 30px; height: 30px; border-radius: 5px; font-size: 15px; font-weight: bold;
       cursor: pointer; display: flex; align-items: center; justify-content: center;
-      box-shadow: 0 4px 10px rgba(0,0,0,0.3); transition: 0.15s;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3); transition: background 0.15s;
     }}
     .zoom-btn:hover {{ background: #3b82f6; }}
     .zoom-indicator {{
       background: rgba(15, 23, 42, 0.85); color: #cbd5e1; font-size: 10px;
-      padding: 2px 4px; border-radius: 4px; text-align: center; border: 1px solid var(--border);
+      padding: 1px 3px; border-radius: 3px; text-align: center; border: 1px solid var(--border);
     }}
 
     .hover-tooltip {{
       position: fixed; display: none; pointer-events: none; z-index: 1000;
       background: rgba(15, 23, 42, 0.96); border: 1px solid #3b82f6; color: white;
-      padding: 9px 13px; border-radius: 7px; font-size: 12px; line-height: 1.45;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
+      padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 280px;
     }}
-    .spread-colorbar {{ display: none; align-items: center; gap: 8px; font-size: 11px; }}
+    .spread-colorbar {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
     .colorbar-gradient {{
-      width: 120px; height: 10px; border-radius: 3px;
+      width: 110px; height: 10px; border-radius: 2px;
       background: linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026);
       border: 1px solid var(--border);
     }}
@@ -745,7 +747,7 @@ html_content = f"""<!DOCTYPE html>
   <div class="toolbar">
     <!-- Row 1: Lead Scrubbing & Spread Underlay -->
     <div class="row">
-      <div style="display: flex; gap: 6px; align-items: center;">
+      <div style="display: flex; gap: 5px; align-items: center;">
         <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
         <select id="leadSelect" onchange="loadStepData()">
           {"".join([f'<option value="{f:03d}">F{f:03d} (+{f}h)</option>' for f in FXX_STEPS])}
@@ -772,37 +774,49 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 2: Isobars -->
+    <!-- Row 2: Isobars with All/None -->
     <div class="panel-box">
       <div class="group-line">
-        <span class="group-label">Isobars (Mean & Det):</span>
+        <span class="group-label">
+          Isobars:
+          <button class="btn-micro" onclick="setGroup('isobars', true)">All</button>
+          <button class="btn-micro" onclick="setGroup('isobars', false)">None</button>
+        </span>
         <label class="checkbox-item"><input type="checkbox" id="chk_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super Mean</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_gefs_mean" checked onchange="draw()"><span class="swatch" style="background:#0044ff;"></span> GEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigefs_mean" checked onchange="draw()"><span class="swatch" style="background:#8e44ad;"></span> AIGEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs_mean" checked onchange="draw()"><span class="swatch" style="background:#d63031;"></span> IFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_mean" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
-        <span style="border-left: 1px solid var(--border); height: 16px; margin: 0 4px;"></span>
+        <span style="border-left: 1px solid var(--border); height: 14px; margin: 0 2px;"></span>
         <label class="checkbox-item"><input type="checkbox" id="chk_gfs_det" onchange="draw()"> GFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigfs_det" onchange="draw()"> AIGFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs_det" onchange="draw()"> IFS Det</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"> AIFS Det</label>
       </div>
 
-      <!-- Row 3: Member Centers -->
+      <!-- Row 3: Member Centers with All/None -->
       <div class="group-line">
-        <span class="group-label">Member Centers:</span>
+        <span class="group-label">
+          Member Centers:
+          <button class="btn-micro" onclick="setGroup('members', true)">All</button>
+          <button class="btn-micro" onclick="setGroup('members', false)">None</button>
+        </span>
         <label class="checkbox-item"><input type="checkbox" id="chk_show_lows" checked onchange="draw()"><span style="color:#e74c3c; font-weight:bold;">Lows (Red)</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_show_highs" checked onchange="draw()"><span style="color:#2980b9; font-weight:bold;">Highs (Blue)</span></label>
-        <span style="border-left: 1px solid var(--border); height: 16px; margin: 0 4px;"></span>
+        <span style="border-left: 1px solid var(--border); height: 14px; margin: 0 2px;"></span>
         <label class="checkbox-item"><input type="checkbox" id="chk_gefs_centers" checked onchange="draw()"> GEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aigefs_centers" checked onchange="draw()"> AIGEFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_ifs_centers" checked onchange="draw()"> IFS</label>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_centers" checked onchange="draw()"> AIFS</label>
       </div>
 
-      <!-- Row 4: Deterministic Centers -->
+      <!-- Row 4: Deterministic Centers with All/None -->
       <div class="group-line">
-        <span class="group-label">Deterministic Centers:</span>
+        <span class="group-label">
+          Deterministic Centers:
+          <button class="btn-micro" onclick="setGroup('det_centers', true)">All</button>
+          <button class="btn-micro" onclick="setGroup('det_centers', false)">None</button>
+        </span>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_gfs" checked onchange="draw()"><span class="badge-tag" style="background:#001155; color:#fff;">GFS</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_aigfs" checked onchange="draw()"><span class="badge-tag" style="background:#4a235a; color:#fff;">AIGFS</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_ifs" checked onchange="draw()"><span class="badge-tag" style="background:#78281f; color:#fff;">IFS</span></label>
@@ -810,11 +824,11 @@ html_content = f"""<!DOCTYPE html>
       </div>
 
       <!-- Row 5: Object-Based Medians -->
-      <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 4px 8px; border-radius: 6px;">
-        <span class="group-label">Ensemble Median:</span>
+      <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 3px 8px; border-radius: 5px;">
+        <span class="group-label" style="min-width: 175px;">Ensemble Median:</span>
         <label class="checkbox-item"><input type="checkbox" id="chk_median_lows" checked onchange="draw()"> <b>Plot Median Lows</b></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_median_highs" onchange="draw()"> <b>Plot Median Highs</b></label>
-        <span style="display: flex; align-items: center; gap: 6px; margin-left: 10px;">
+        <span style="display: flex; align-items: center; gap: 6px; margin-left: 8px;">
           <span>Min Consensus:</span>
           <select id="minPctSelect" onchange="draw()">
             <option value="15">≥ 15%</option>
@@ -839,7 +853,7 @@ html_content = f"""<!DOCTYPE html>
     <div class="zoom-controls">
       <button class="zoom-btn" onclick="zoomDelta(1.3)" title="Zoom In">+</button>
       <button class="zoom-btn" onclick="zoomDelta(0.77)" title="Zoom Out">−</button>
-      <button class="zoom-btn" onclick="resetZoom()" title="Reset / Fit CONUS" style="font-size:11px;">Fit</button>
+      <button class="zoom-btn" onclick="resetZoom()" title="Reset / Fit Screen" style="font-size:10px;">Fit</button>
       <div class="zoom-indicator" id="zoomLevelText">1.0x</div>
     </div>
   </div>
@@ -867,6 +881,32 @@ html_content = f"""<!DOCTYPE html>
     const tooltip = document.getElementById('hoverTooltip');
 
     underlayImg.onload = () => draw();
+
+    // Bulk Group Toggle Handler
+    function setGroup(grp, state) {{
+      if (grp === 'isobars') {{
+        ['chk_super', 'chk_gefs_mean', 'chk_aigefs_mean', 'chk_ifs_mean', 'chk_aifs_mean',
+         'chk_gfs_det', 'chk_aigfs_det', 'chk_ifs_det', 'chk_aifs_det'].forEach(id => {{
+          const el = document.getElementById(id);
+          if (el) el.checked = state;
+        }});
+      }} else if (grp === 'members') {{
+        ['chk_gefs_centers', 'chk_aigefs_centers', 'chk_ifs_centers', 'chk_aifs_centers'].forEach(id => {{
+          const el = document.getElementById(id);
+          if (el) el.checked = state;
+        }});
+        if (state) {{
+          document.getElementById('chk_show_lows').checked = true;
+          document.getElementById('chk_show_highs').checked = true;
+        }}
+      }} else if (grp === 'det_centers') {{
+        ['chk_det_gfs', 'chk_det_aigfs', 'chk_det_ifs', 'chk_det_aifs'].forEach(id => {{
+          const el = document.getElementById(id);
+          if (el) el.checked = state;
+        }});
+      }}
+      draw();
+    }}
 
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
@@ -1001,7 +1041,6 @@ html_content = f"""<!DOCTYPE html>
       const mx = (e.clientX - rect.left) * scaleX;
       const my = (e.clientY - rect.top) * scaleY;
 
-      // Coordinate in unscaled map canvas space
       const mapX = (mx - panX) / zoom;
       const mapY = (my - panY) / zoom;
 
@@ -1010,7 +1049,7 @@ html_content = f"""<!DOCTYPE html>
       const showMedHighs = document.getElementById('chk_median_highs').checked;
 
       let closest = null;
-      let minDist = 28 / zoom; // Snapping radius around cluster badge
+      let minDist = 28 / zoom;
 
       const activeClusters = [];
       if (showMedLows && currentStepData.median_lows) {{
@@ -1063,7 +1102,6 @@ html_content = f"""<!DOCTYPE html>
       ctx.translate(panX, panY);
       ctx.scale(zoom, zoom);
 
-      // 1. Draw Static / Spread Underlay
       if (underlayImg.complete && underlayImg.naturalWidth !== 0) {{
         ctx.drawImage(underlayImg, 0, 0, CANVAS_W, CANVAS_H);
       }}
@@ -1128,7 +1166,7 @@ html_content = f"""<!DOCTYPE html>
         legendItems.push({{ label: 'AIFS Mean', color: '#00b894', dash: false }});
       }}
 
-      // Superensemble Mean (Solid Black)
+      // Superensemble Mean
       if (document.getElementById('chk_super').checked && currentStepData.super_mean) {{
         drawLines(currentStepData.super_mean, '#000000', 3.0);
         legendItems.push({{ label: 'Superensemble Mean', color: '#000000', dash: false }});
@@ -1145,7 +1183,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Member Extrema (Fixed Screen-Space Font Sizing)
+      // Member Extrema
       const showLows = document.getElementById('chk_show_lows').checked;
       const showHighs = document.getElementById('chk_show_highs').checked;
       
@@ -1173,7 +1211,7 @@ html_content = f"""<!DOCTYPE html>
         }});
       }});
 
-      // 3. Deterministic Centers (Rendered as Bold Boxed Badges)
+      // Deterministic Centers
       const detConfigs = [
         {{ key: 'gfs', chk: 'chk_det_gfs', color: '#001155', tag: 'GFS' }},
         {{ key: 'aigfs', chk: 'chk_det_aigfs', color: '#4a235a', tag: 'AIGFS' }},
@@ -1211,7 +1249,7 @@ html_content = f"""<!DOCTYPE html>
         if (showHighs && extrema.highs) renderDetBadge(extrema.highs, false);
       }});
 
-      // 4. Density-Seeded Median Badges
+      // Density-Seeded Median Badges
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
       const plotMedLows = document.getElementById('chk_median_lows').checked;
       const plotMedHighs = document.getElementById('chk_median_highs').checked;
