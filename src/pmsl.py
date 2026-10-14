@@ -49,7 +49,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. CYCLE DETECTOR (MONITORING IFS & AIGEFS SFC AT F240)
+# 2. CYCLE DETECTOR (IFS & AIGEFS SFC AT F240)
 # ==============================================================================
 def detect_latest_complete_cycle():
     now = datetime.utcnow()
@@ -178,9 +178,10 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 4. EXTREMA EXTRACTION & MEDIAN CLUSTERING
+# 4. EXTREMA EXTRACTION & DENSITY-SEEDED RADIAL CLUSTERING
 # ==============================================================================
 def detect_member_centers(grid):
+    """Identifies local Lows and Highs using 2D neighborhood filters."""
     if grid is None or np.all(np.isnan(grid)):
         return {"lows": [], "highs": []}
     
@@ -217,7 +218,11 @@ def detect_member_centers(grid):
             
     return {"lows": lows, "highs": highs}
 
-def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=450.0):
+def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=350.0):
+    """
+    Groups member centers using density-seeded radial clustering.
+    Prevents single-linkage chaining along fronts, troughs, and elongated gradients.
+    """
     all_centers = []
     for m_idx, centers in enumerate(member_extrema_list):
         for pt in centers.get(center_type, []):
@@ -225,47 +230,64 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
             
     if not all_centers:
         return []
-        
-    n = len(all_centers)
-    visited = [False] * n
-    clusters = []
-    
+
     def approx_dist_km(lat1, lon1, lat2, lon2):
         dlat = (lat2 - lat1) * 111.0
         dlon = (lon2 - lon1) * 111.0 * np.cos(np.radians(0.5 * (lat1 + lat2)))
         return np.sqrt(dlat**2 + dlon**2)
-    
-    for i in range(n):
-        if visited[i]:
-            continue
-        cluster = [all_centers[i]]
-        visited[i] = True
-        queue = [all_centers[i]]
+
+    unassigned = list(all_centers)
+    clusters = []
+    min_members = max(3, int(total_members * 0.10))  # Minimum 10% threshold
+
+    while unassigned:
+        best_seed = None
+        max_unique_members = -1
         
-        while queue:
-            curr = queue.pop(0)
-            for j in range(n):
-                if not visited[j]:
-                    dist = approx_dist_km(curr["lat"], curr["lon"], all_centers[j]["lat"], all_centers[j]["lon"])
-                    if dist <= radius_km:
-                        visited[j] = True
-                        cluster.append(all_centers[j])
-                        queue.append(all_centers[j])
-                        
-        member_ids = set(item["member"] for item in cluster)
-        support_count = len(member_ids)
+        # Identify the densest core of unique members
+        for cand in unassigned:
+            nearby = [p for p in unassigned if approx_dist_km(cand["lat"], cand["lon"], p["lat"], p["lon"]) <= radius_km]
+            unique_count = len(set(p["member"] for p in nearby))
+            
+            if unique_count > max_unique_members:
+                max_unique_members = unique_count
+                best_seed = cand
+            elif unique_count == max_unique_members and best_seed is not None:
+                if (center_type == "lows" and cand["val"] < best_seed["val"]) or \
+                   (center_type == "highs" and cand["val"] > best_seed["val"]):
+                    best_seed = cand
+
+        if max_unique_members < min_members or best_seed is None:
+            break
+
+        # Radial extraction centered strictly on the seed
+        cluster_pts = [p for p in unassigned if approx_dist_km(best_seed["lat"], best_seed["lon"], p["lat"], p["lon"]) <= radius_km]
+
+        # Deduplicate: each ensemble member contributes its deepest center within this cyclone
+        member_dict = {}
+        for p in cluster_pts:
+            m = p["member"]
+            if m not in member_dict:
+                member_dict[m] = p
+            else:
+                if (center_type == "lows" and p["val"] < member_dict[m]["val"]) or \
+                   (center_type == "highs" and p["val"] > member_dict[m]["val"]):
+                    member_dict[m] = p
+
+        final_pts = list(member_dict.values())
+        support_count = len(final_pts)
         support_pct = (support_count / total_members) * 100.0 if total_members > 0 else 0
-        
-        pressures = [item["val"] for item in cluster]
+
+        pressures = [p["val"] for p in final_pts]
         med_p = float(np.median(pressures))
-        med_lat = float(np.median([item["lat"] for item in cluster]))
-        med_lon = float(np.median([item["lon"] for item in cluster]))
-        
+        med_lat = float(np.median([p["lat"] for p in final_pts]))
+        med_lon = float(np.median([p["lon"] for p in final_pts]))
+
         disp_pt = geo_trans.transform(np.array([[med_lon, med_lat]]))
         fig_pt = fig.transFigure.inverted().transform(disp_pt)[0]
         px = int(round(fig_pt[0] * CANVAS_W))
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
-        
+
         clusters.append({
             "type": "L" if center_type == "lows" else "H",
             "x": px,
@@ -282,12 +304,16 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
             "total_members": total_members,
             "pct": round(support_pct, 1)
         })
-        
+
+        # Remove points belonging to this cluster from the candidate pool
+        assigned_keys = set((p["lat"], p["lon"], p["member"]) for p in cluster_pts)
+        unassigned = [p for p in unassigned if (p["lat"], p["lon"], p["member"]) not in assigned_keys]
+
     return clusters
 
 
 # ==============================================================================
-# 5. DATA INGESTION (UPDATED TO SCN 25-89 SFC SPECIFICATIONS)
+# 5. DATA INGESTION ENGINE
 # ==============================================================================
 def fetch_gefs_pmsl(fxx):
     members = ["c00"] + [f"p{str(i).zfill(2)}" for i in range(1, 31)]
@@ -364,7 +390,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None and res.ndim == 2:
+            if res is not None:
                 grids.append(res)
     return grids
 
@@ -535,7 +561,6 @@ for fxx in FXX_STEPS:
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing PMSL Lead F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
-    # Ingest ensembles
     gefs_mems   = fetch_gefs_pmsl(fxx)
     aigefs_mems = fetch_aigefs_pmsl(fxx)
     ifs_mems    = fetch_ifs_pmsl(fxx)
@@ -544,33 +569,28 @@ for fxx in FXX_STEPS:
     all_members = gefs_mems + aigefs_mems + ifs_mems + aifs_mems
     print(f"  ↳ Members loaded: GEFS={len(gefs_mems)}, AIGEFS={len(aigefs_mems)}, IFS={len(ifs_mems)}, AIFS={len(aifs_mems)} (Total: {len(all_members)})")
 
-    # Ingest deterministics
     det_gfs   = fetch_det_pmsl("gfs", "pgrb2.0p25", ":PRMSL:mean sea level:", fxx)
     det_aigfs = fetch_aigfs_pmsl(fxx)
     det_ifs   = fetch_det_pmsl("ifs", "oper", ":msl:", fxx)
     det_aifs  = fetch_det_pmsl("aifs", "oper", ":msl:", fxx)
 
-    # Compute means
     gefs_mean   = np.mean(np.stack(gefs_mems), axis=0) if gefs_mems else None
     aigefs_mean = np.mean(np.stack(aigefs_mems), axis=0) if aigefs_mems else None
     ifs_mean    = np.mean(np.stack(ifs_mems), axis=0) if ifs_mems else None
     aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # Render spread underlays
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
             render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png")
 
-    # Detect centers for all members
     gefs_extrema   = [detect_member_centers(m) for m in gefs_mems]
     aigefs_extrema = [detect_member_centers(m) for m in aigefs_mems]
     ifs_extrema    = [detect_member_centers(m) for m in ifs_mems]
     aifs_extrema   = [detect_member_centers(m) for m in aifs_mems]
     all_extrema    = gefs_extrema + aigefs_extrema + ifs_extrema + aifs_extrema
 
-    # Detect centers for deterministics
     det_extrema = {
         "gfs": detect_member_centers(det_gfs),
         "aigfs": detect_member_centers(det_aigfs),
@@ -578,10 +598,9 @@ for fxx in FXX_STEPS:
         "aifs": detect_member_centers(det_aifs)
     }
 
-    # Group median clusters
     total_mem_count = len(all_members)
-    median_low_clusters  = cluster_extrema_medians(all_extrema, total_mem_count, center_type="lows")
-    median_high_clusters = cluster_extrema_medians(all_extrema, total_mem_count, center_type="highs")
+    median_low_clusters  = cluster_extrema_medians(all_extrema, total_mem_count, center_type="lows", radius_km=350.0)
+    median_high_clusters = cluster_extrema_medians(all_extrema, total_mem_count, center_type="highs", radius_km=350.0)
 
     step_data = {
         "fxx": fxx,
@@ -613,7 +632,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. FRONTEND (CANVAS RENDERING, PAN/ZOOM, TOOLTIPS & DET CENTERS)
+# 8. FRONTEND GENERATOR (SYNCED HOVER TOOLTIP & PAN/ZOOM)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -704,9 +723,9 @@ html_content = f"""<!DOCTYPE html>
 
     .hover-tooltip {{
       position: fixed; display: none; pointer-events: none; z-index: 1000;
-      background: rgba(15, 23, 42, 0.95); border: 1px solid #3b82f6; color: white;
-      padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
-      box-shadow: 0 6px 20px rgba(0,0,0,0.6); max-width: 280px;
+      background: rgba(15, 23, 42, 0.96); border: 1px solid #3b82f6; color: white;
+      padding: 9px 13px; border-radius: 7px; font-size: 12px; line-height: 1.45;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
     }}
     .spread-colorbar {{ display: none; align-items: center; gap: 8px; font-size: 11px; }}
     .colorbar-gradient {{
@@ -720,11 +739,11 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">Cycle: {global_init_time}Z | Interactive Deep Zoom & Deterministic Overlays</div>
+    <div class="subtitle">Cycle: {global_init_time}Z | Density-Seeded Medians & Synced Inspection</div>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Lead Scrubbing & Underlay -->
+    <!-- Row 1: Lead Scrubbing & Spread Underlay -->
     <div class="row">
       <div style="display: flex; gap: 6px; align-items: center;">
         <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
@@ -835,7 +854,6 @@ html_content = f"""<!DOCTYPE html>
     let underlayImg = new Image();
     underlayImg.src = 'basemap.png';
 
-    // Pan & Zoom State
     let zoom = 1.0;
     let panX = 0;
     let panY = 0;
@@ -969,7 +987,7 @@ html_content = f"""<!DOCTYPE html>
     window.addEventListener('mouseup', () => {{ isDragging = false; }});
 
     // =========================================================================
-    // HOVER CLUSTER INSPECTION TOOLTIP
+    // SYNCED CLUSTER INSPECTION TOOLTIP
     // =========================================================================
     function handleHoverInspection(e) {{
       if (!currentStepData) return;
@@ -983,41 +1001,47 @@ html_content = f"""<!DOCTYPE html>
       const mx = (e.clientX - rect.left) * scaleX;
       const my = (e.clientY - rect.top) * scaleY;
 
-      // Coordinate in map space
+      // Coordinate in unscaled map canvas space
       const mapX = (mx - panX) / zoom;
       const mapY = (my - panY) / zoom;
-      const searchRadius = 24 / zoom;
 
-      const nearbyLows = [];
-      function gather(ensList, label) {{
-        if (!ensList) return;
-        ensList.forEach(m => {{
-          m.lows.forEach(pt => {{
-            const dist = Math.hypot(pt.x - mapX, pt.y - mapY);
-            if (dist <= searchRadius) nearbyLows.push({{ ...pt, suite: label }});
-          }});
-        }});
+      const minPct = parseFloat(document.getElementById('minPctSelect').value);
+      const showMedLows = document.getElementById('chk_median_lows').checked;
+      const showMedHighs = document.getElementById('chk_median_highs').checked;
+
+      let closest = null;
+      let minDist = 28 / zoom; // Snapping radius around cluster badge
+
+      const activeClusters = [];
+      if (showMedLows && currentStepData.median_lows) {{
+        activeClusters.push(...currentStepData.median_lows);
+      }}
+      if (showMedHighs && currentStepData.median_highs) {{
+        activeClusters.push(...currentStepData.median_highs);
       }}
 
-      gather(currentStepData.gefs_extrema, "GEFS");
-      gather(currentStepData.aigefs_extrema, "AIGEFS");
-      gather(currentStepData.ifs_extrema, "IFS");
-      gather(currentStepData.aifs_extrema, "AIFS");
+      activeClusters.forEach(c => {{
+        if (c.pct < minPct) return;
+        const dist = Math.hypot(c.x - mapX, c.y - mapY);
+        if (dist < minDist) {{
+          minDist = dist;
+          closest = c;
+        }}
+      }});
 
-      if (nearbyLows.length >= 3) {{
-        const pressures = nearbyLows.map(p => p.val).sort((a,b) => a - b);
-        const minP = pressures[0];
-        const maxP = pressures[pressures.length - 1];
-        const medP = pressures[Math.floor(pressures.length / 2)];
-        
+      if (closest) {{
+        const isLow = closest.type === 'L';
+        const typeColor = isLow ? '#ef4444' : '#38bdf8';
         tooltip.innerHTML = `
-          <b>Local Low Cluster</b> (${{nearbyLows.length}} members)<br>
-          <b>Median:</b> ${{medP}} hPa | <b>Range:</b> ${{minP}} - ${{maxP}} hPa<br>
+          <div style="font-weight:bold; color:${{typeColor}}; font-size:13px; margin-bottom:4px;">
+            ${{isLow ? '▼ Ensemble Median Low' : '▲ Ensemble Median High'}}
+          </div>
+          <div><b>Median Pressure:</b> ${{closest.median_p}} hPa</div>
+          <div><b>10th–90th Spread:</b> ${{closest.p10}} – ${{closest.p90}} hPa</div>
+          <div><b>Full Member Range:</b> ${{closest.min_p}} – ${{closest.max_p}} hPa</div>
+          <div><b>Consensus:</b> ${{closest.pct}}% (${{closest.count}}/${{closest.total_members}} members)</div>
           <div style="font-size:11px; color:#94a3b8; margin-top:4px;">
-            GEFS: ${{nearbyLows.filter(p=>p.suite==='GEFS').length}} | 
-            AIGEFS: ${{nearbyLows.filter(p=>p.suite==='AIGEFS').length}} | 
-            IFS: ${{nearbyLows.filter(p=>p.suite==='IFS').length}} | 
-            AIFS: ${{nearbyLows.filter(p=>p.suite==='AIFS').length}}
+            <b>Center:</b> ${{closest.lat.toFixed(1)}}°N, ${{Math.abs(closest.lon).toFixed(1)}}°W
           </div>
         `;
         tooltip.style.left = (e.clientX + 14) + 'px';
@@ -1039,7 +1063,7 @@ html_content = f"""<!DOCTYPE html>
       ctx.translate(panX, panY);
       ctx.scale(zoom, zoom);
 
-      // 1. Draw Underlay
+      // 1. Draw Static / Spread Underlay
       if (underlayImg.complete && underlayImg.naturalWidth !== 0) {{
         ctx.drawImage(underlayImg, 0, 0, CANVAS_W, CANVAS_H);
       }}
@@ -1121,7 +1145,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 2. Member Extrema (Fixed Screen-Space Font Sizing to Unclutter on Zoom)
+      // 2. Member Extrema (Fixed Screen-Space Font Sizing)
       const showLows = document.getElementById('chk_show_lows').checked;
       const showHighs = document.getElementById('chk_show_highs').checked;
       
@@ -1187,7 +1211,7 @@ html_content = f"""<!DOCTYPE html>
         if (showHighs && extrema.highs) renderDetBadge(extrema.highs, false);
       }});
 
-      // 4. Object-Based Median Lows & Highs
+      // 4. Density-Seeded Median Badges
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
       const plotMedLows = document.getElementById('chk_median_lows').checked;
       const plotMedHighs = document.getElementById('chk_median_highs').checked;
