@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import xarray as xr
 from scipy.ndimage import minimum_filter, maximum_filter
+from scipy.spatial import ConvexHull
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -29,7 +30,7 @@ SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(SPREAD_DIR, exist_ok=True)
 
-# 0 to 240 hours every 12 hours (21 lead times)
+# 0 to 240 hours every 12 hours (21 lead times)[cite: 2]
 FXX_STEPS = list(range(0, 241, 12))
 PMSL_CONTOURS = list(range(960, 1052, 4))
 CANVAS_W, CANVAS_H = 1200, 800
@@ -49,7 +50,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. CYCLE DETECTOR (IFS & AIGEFS SFC AT F240)
+# 2. CYCLE DETECTOR (MONITORING IFS & AIGEFS SFC AT F240)
 # ==============================================================================
 def detect_latest_complete_cycle():
     now = datetime.utcnow()
@@ -93,7 +94,7 @@ def detect_latest_complete_cycle():
             pass
 
         if ifs_ready and aigefs_ready:
-            print(f"🎯 Target Cycle Verified: {cycle_str}Z (All global suites complete out to 240h)\n")
+            print(f"🎯 Target Cycle Verified: {cycle_str}Z\n")
             return cycle_str
 
     fallback_str = candidates[1].strftime('%Y-%m-%d %H:00')
@@ -101,6 +102,20 @@ def detect_latest_complete_cycle():
     return fallback_str
 
 global_init_time = detect_latest_complete_cycle()
+
+# ------------------------------------------------------------------------------
+# Output-Level Caching Check: Exit early if cycle is already complete
+# ------------------------------------------------------------------------------
+final_json_file = os.path.join(DATA_DIR, f"f{FXX_STEPS[-1]:03d}.json")
+if os.path.exists(final_json_file):
+    try:
+        with open(final_json_file, "r") as f:
+            last_meta = json.load(f)
+        if last_meta.get("init") == global_init_time:
+            print(f"✨ Output for cycle {global_init_time}Z is already fully built! Exiting.")
+            exit(0)
+    except Exception:
+        pass
 
 print("🗺️ Rendering Cartopy basemap...")
 fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -178,7 +193,7 @@ def extract_contours(grid):
 
 
 # ==============================================================================
-# 4. EXTREMA EXTRACTION & DENSITY-SEEDED RADIAL CLUSTERING
+# 4. EXTREMA EXTRACTION, MEDIAN CLUSTERING & 90% PEELING CONVEX HULL
 # ==============================================================================
 def detect_member_centers(grid):
     if grid is None or np.all(np.isnan(grid)):
@@ -217,11 +232,37 @@ def detect_member_centers(grid):
             
     return {"lows": lows, "highs": highs}
 
+def compute_90pct_peeled_hull(pts):
+    """
+    Computes a 90% peeled convex hull using Mahalanobis distance ranking.
+    Discards the outer 10% spatial outliers and bounds the 90% core.
+    """
+    if len(pts) < 4:
+        return None
+    coords = np.array([[p["x"], p["y"]] for p in pts], dtype=float)
+    try:
+        mu = np.mean(coords, axis=0)
+        cov = np.cov(coords, rowvar=False)
+        # Avoid singular matrix if collinear
+        if np.linalg.matrix_rank(cov) < 2:
+            dists = np.linalg.norm(coords - mu, axis=1)
+        else:
+            inv_cov = np.linalg.pinv(cov)
+            diff = coords - mu
+            dists = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
+
+        # Keep inner 90%
+        k = max(3, int(np.ceil(0.90 * len(pts))))
+        keep_indices = np.argsort(dists)[:k]
+        filtered_coords = coords[keep_indices]
+
+        hull = ConvexHull(filtered_coords)
+        hull_pts = filtered_coords[hull.vertices].tolist()
+        return [[int(round(pt[0])), int(round(pt[1]))] for pt in hull_pts]
+    except Exception:
+        return None
+
 def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=350.0, model_tag="SUPER", color="#000000"):
-    """
-    Groups member centers using density-seeded radial clustering.
-    Supports both superensemble and suite-specific cluster calculation.
-    """
     all_centers = []
     for m_idx, centers in enumerate(member_extrema_list):
         for pt in centers.get(center_type, []):
@@ -284,6 +325,9 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
         px = int(round(fig_pt[0] * CANVAS_W))
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
 
+        # Compute 90% peeled hull polygon (Superensemble only)
+        hull_polygon = compute_90pct_peeled_hull(final_pts) if model_tag == "SUPER" else None
+
         clusters.append({
             "model": model_tag,
             "color": color,
@@ -300,7 +344,8 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
             "max_p": round(float(np.max(pressures)), 1),
             "count": support_count,
             "total_members": total_members,
-            "pct": round(support_pct, 1)
+            "pct": round(support_pct, 1),
+            "hull": hull_polygon
         })
 
         assigned_keys = set((p["lat"], p["lon"], p["member"]) for p in cluster_pts)
@@ -387,7 +432,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None and res.ndim == 2:
+            if res is not None:
                 grids.append(res)
     return grids
 
@@ -497,10 +542,13 @@ def fetch_det_pmsl(model_name, product, search_str, fxx):
 
 
 # ==============================================================================
-# 6. ENSEMBLE SPREAD UNDERLAYS
+# 6. SPREAD & PHYSICS VS. AI DIFFERENCE UNDERLAYS
 # ==============================================================================
 PMSL_SPREAD_LEVELS = np.arange(1.0, 13.0, 1.0)
 SPREAD_CMAP = plt.cm.YlOrRd
+
+DIFF_LEVELS = [-10, -8, -6, -4, -2, -1, 1, 2, 4, 6, 8, 10]
+DIFF_CMAP = plt.cm.RdBu_r  # Blue: Phys Deeper (Neg), Red: AI Deeper (Pos)
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
@@ -526,8 +574,8 @@ def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
         "aifs": spr_aifs
     }
 
-def render_spread_underlay(spread_grid, filename):
-    if spread_grid is None or np.all(np.isnan(spread_grid)):
+def render_underlay(grid, filename, levels, cmap):
+    if grid is None or np.all(np.isnan(grid)):
         return
     fig_spr = plt.figure(figsize=(12, 8), dpi=100)
     ax_spr = fig_spr.add_axes([0, 0, 1, 1], projection=ccrs.LambertConformal(central_longitude=-96.0, central_latitude=39.0))
@@ -537,9 +585,9 @@ def render_spread_underlay(spread_grid, filename):
     ax_spr.add_feature(cfeature.OCEAN, facecolor="#eef2f5")
     
     ax_spr.contourf(
-        target_lons, target_lats, spread_grid,
-        levels=PMSL_SPREAD_LEVELS, cmap=SPREAD_CMAP,
-        transform=ccrs.PlateCarree(), extend='max', alpha=0.85
+        target_lons, target_lats, grid,
+        levels=levels, cmap=cmap,
+        transform=ccrs.PlateCarree(), extend='both', alpha=0.85
     )
     
     ax_spr.add_feature(cfeature.COASTLINE, linewidth=1.0, edgecolor="#333333")
@@ -555,6 +603,19 @@ def render_spread_underlay(spread_grid, filename):
 # 7. BATCH EXTRACTION & PROCESSING LOOP
 # ==============================================================================
 for fxx in FXX_STEPS:
+    step_json_path = os.path.join(DATA_DIR, f"f{fxx:03d}.json")
+    
+    # Lead-level caching: skip if step file exists and matches current init cycle
+    if os.path.exists(step_json_path):
+        try:
+            with open(step_json_path, "r") as f:
+                cached_step = json.load(f)
+            if cached_step.get("init") == global_init_time:
+                print(f"⏩ Lead F{fxx:03d} already processed for {global_init_time}Z. Skipping.")
+                continue
+        except Exception:
+            pass
+
     valid_time = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M') + timedelta(hours=fxx)
     print(f"\n📦 Processing PMSL Lead F{fxx:03d} (Valid: {valid_time.strftime('%Y-%m-%d %H:%MZ')})...")
     
@@ -577,10 +638,20 @@ for fxx in FXX_STEPS:
     aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
+    # Render spread underlays
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
-            render_spread_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png")
+            render_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png", PMSL_SPREAD_LEVELS, SPREAD_CMAP)
+
+    # Render Physics vs. AI Difference Underlay: ΔP = Mean(Phys) - Mean(AI)
+    phys_pool = [m for m in [gefs_mean, ifs_mean] if m is not None]
+    ai_pool   = [m for m in [aigefs_mean, aifs_mean] if m is not None]
+    if phys_pool and ai_pool:
+        phys_comp = np.mean(np.stack(phys_pool), axis=0)
+        ai_comp   = np.mean(np.stack(ai_pool), axis=0)
+        diff_p    = phys_comp - ai_comp
+        render_underlay(diff_p, f"diff_f{fxx:03d}.png", DIFF_LEVELS, DIFF_CMAP)
 
     gefs_extrema   = [detect_member_centers(m) for m in gefs_mems]
     aigefs_extrema = [detect_member_centers(m) for m in aigefs_mems]
@@ -597,7 +668,7 @@ for fxx in FXX_STEPS:
 
     total_mem_count = len(all_members)
 
-    # 1. Superensemble Median Clusters
+    # 1. Superensemble Median Clusters (with 90% Peeled Convex Hull)
     super_med_lows  = cluster_extrema_medians(all_extrema, total_mem_count, "lows", 350.0, "SUPER", "#000000")
     super_med_highs = cluster_extrema_medians(all_extrema, total_mem_count, "highs", 350.0, "SUPER", "#000000")
 
@@ -649,14 +720,14 @@ for fxx in FXX_STEPS:
         }
     }
 
-    with open(os.path.join(DATA_DIR, f"f{fxx:03d}.json"), "w") as f:
+    with open(step_json_path, "w") as f:
         json.dump(step_data, f, separators=(',', ':'))
 
 plt.close(fig)
 
 
 # ==============================================================================
-# 8. FRONTEND GENERATOR (SUITE MEDIANS & COMPACT CONTROLS)
+# 8. FRONTEND GENERATOR (PEELED HULLS & PHYSICS VS. AI DIAGNOSTICS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -761,10 +832,17 @@ html_content = f"""<!DOCTYPE html>
       padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
       box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
     }}
-    .spread-colorbar {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
-    .colorbar-gradient {{
+    
+    /* Dynamic Colorbars */
+    .cbar-container {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
+    .colorbar-spread {{
       width: 110px; height: 10px; border-radius: 2px;
       background: linear-gradient(to right, #ffffcc, #fed976, #feb24c, #fd8d3c, #f03b20, #bd0026);
+      border: 1px solid var(--border);
+    }}
+    .colorbar-diff {{
+      width: 120px; height: 10px; border-radius: 2px;
+      background: linear-gradient(to right, #0571b0, #92c5de, #f7f7f7, #f4a582, #ca0020);
       border: 1px solid var(--border);
     }}
   </style>
@@ -773,7 +851,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">Cycle: {global_init_time}Z | Multi-Suite Medians & Interactive Synoptic Inspection</div>
+    <div class="subtitle">Cycle: {global_init_time}Z | 90% Peeled Spread Hulls & Physics vs. AI Diagnostics</div>
   </div>
 
   <div class="toolbar">
@@ -793,15 +871,25 @@ html_content = f"""<!DOCTYPE html>
           <option value="none">Basemap Only</option>
           <option value="total">Total Superensemble Spread (σ)</option>
           <option value="inter">Inter-Model Disagreement (σ_inter)</option>
+          <option value="diff">Physics vs. AI Disagreement (ΔP)</option>
           <option value="gefs">GEFS Spread</option>
           <option value="aigefs">AIGEFS Spread</option>
           <option value="ifs">IFS Spread</option>
           <option value="aifs">AIFS Spread</option>
         </select>
-        <div class="spread-colorbar" id="cbarBox">
+
+        <!-- Spread Colorbar -->
+        <div class="cbar-container" id="cbarSpread">
           <span>1 hPa</span>
-          <div class="colorbar-gradient"></div>
+          <div class="colorbar-spread"></div>
           <span>12+ hPa</span>
+        </div>
+
+        <!-- Physics vs AI Diff Colorbar -->
+        <div class="cbar-container" id="cbarDiff">
+          <span style="color:#60a5fa;">Phys Deeper (-10)</span>
+          <div class="colorbar-diff"></div>
+          <span style="color:#f87171;">AI Deeper (+10)</span>
         </div>
       </div>
     </div>
@@ -855,7 +943,7 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_aifs" checked onchange="draw()"><span class="badge-tag" style="background:#145a32; color:#fff;">AIFS</span></label>
       </div>
 
-      <!-- Row 5: Ensemble Medians (Super & Individual Suites) -->
+      <!-- Row 5: Ensemble Medians & 90% Spread Hull -->
       <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 4px 8px; border-radius: 5px;">
         <span class="group-label">
           Ensemble Medians:
@@ -871,6 +959,7 @@ html_content = f"""<!DOCTYPE html>
         <span style="border-left: 1px solid var(--border); height: 14px; margin: 0 4px;"></span>
         <label class="checkbox-item"><input type="checkbox" id="chk_med_type_lows" checked onchange="draw()"><span style="color:#e74c3c; font-weight:bold;">Lows</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_med_type_highs" onchange="draw()"><span style="color:#2980b9; font-weight:bold;">Highs</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_show_hull" checked onchange="draw()"> <span style="font-weight:600; color:#38bdf8;">90% Spread Hull</span></label>
         
         <span style="display: flex; align-items: center; gap: 5px; margin-left: 6px;">
           <span>Min Consensus:</span>
@@ -959,14 +1048,20 @@ html_content = f"""<!DOCTYPE html>
     function updateBackground() {{
       const bg = document.getElementById('bgSelect').value;
       const fxx = document.getElementById('leadSelect').value;
-      const cbar = document.getElementById('cbarBox');
+      const cbarSpread = document.getElementById('cbarSpread');
+      const cbarDiff = document.getElementById('cbarDiff');
+
+      cbarSpread.style.display = 'none';
+      cbarDiff.style.display = 'none';
 
       if (bg === 'none') {{
         underlayImg.src = 'basemap.png';
-        cbar.style.display = 'none';
+      }} else if (bg === 'diff') {{
+        underlayImg.src = `spread/diff_f${{fxx}}.png`;
+        cbarDiff.style.display = 'flex';
       }} else {{
         underlayImg.src = `spread/${{bg}}_f${{fxx}}.png`;
-        cbar.style.display = 'flex';
+        cbarSpread.style.display = 'flex';
       }}
     }}
 
@@ -1111,7 +1206,6 @@ html_content = f"""<!DOCTYPE html>
         }}
       }});
 
-      // Snapping distance
       const nearby = activeClusters.filter(c => {{
         if (c.pct < minPct) return false;
         return Math.hypot(c.x - mapX, c.y - mapY) < (30 / zoom);
@@ -1238,7 +1332,40 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // Member Extrema Centers
+      // 90% Peeled Convex Hulls (Superensemble Uncertainty Core)
+      const minPct = parseFloat(document.getElementById('minPctSelect').value);
+      const showHull = document.getElementById('chk_show_hull').checked;
+      const plotMedLows = document.getElementById('chk_med_type_lows').checked;
+      const plotMedHighs = document.getElementById('chk_med_type_highs').checked;
+      const showSuperMed = document.getElementById('chk_med_super').checked;
+
+      if (showHull && showSuperMed) {{
+        function drawHull(c, fillColor, strokeColor) {{
+          if (!c.hull || c.hull.length < 3 || c.pct < minPct) return;
+          ctx.beginPath();
+          ctx.moveTo(c.hull[0][0], c.hull[0][1]);
+          for (let i = 1; i < c.hull.length; i++) {{
+            ctx.lineTo(c.hull[i][0], c.hull[i][1]);
+          }}
+          ctx.closePath();
+          ctx.fillStyle = fillColor;
+          ctx.fill();
+          ctx.lineWidth = 1.6 / zoom;
+          ctx.strokeStyle = strokeColor;
+          ctx.setLineDash([5 / zoom, 3 / zoom]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }}
+
+        if (plotMedLows && currentStepData.median_lows && currentStepData.median_lows.super) {{
+          currentStepData.median_lows.super.forEach(c => drawHull(c, 'rgba(239, 68, 68, 0.12)', 'rgba(220, 38, 38, 0.7)'));
+        }}
+        if (plotMedHighs && currentStepData.median_highs && currentStepData.median_highs.super) {{
+          currentStepData.median_highs.super.forEach(c => drawHull(c, 'rgba(59, 130, 246, 0.12)', 'rgba(37, 99, 235, 0.7)'));
+        }}
+      }}
+
+      // Member Extrema Centers[cite: 1]
       const showLows = document.getElementById('chk_show_lows').checked;
       const showHighs = document.getElementById('chk_show_highs').checked;
       
@@ -1304,11 +1431,7 @@ html_content = f"""<!DOCTYPE html>
         if (showHighs && extrema.highs) renderDetBadge(extrema.highs, false);
       }});
 
-      // Ensemble Medians (Super & Individual Suites)
-      const minPct = parseFloat(document.getElementById('minPctSelect').value);
-      const plotMedLows = document.getElementById('chk_med_type_lows').checked;
-      const plotMedHighs = document.getElementById('chk_med_type_highs').checked;
-
+      // Ensemble Medians (Suite Badges)
       const suiteActive = {{
         super: document.getElementById('chk_med_super').checked,
         gefs: document.getElementById('chk_med_gefs').checked,
@@ -1322,7 +1445,6 @@ html_content = f"""<!DOCTYPE html>
         const isSuper = c.model === 'SUPER';
         const r = (isSuper ? 18 : 15.5) / zoom;
 
-        // Base badge
         ctx.beginPath();
         ctx.arc(c.x, c.y, r, 0, 2 * Math.PI);
         ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
@@ -1331,23 +1453,19 @@ html_content = f"""<!DOCTYPE html>
         ctx.strokeStyle = c.color;
         ctx.stroke();
 
-        // Model Tag
         ctx.font = `bold ${{Math.round((isSuper ? 7.5 : 7.0) / zoom)}}px sans-serif`;
         ctx.fillStyle = c.color;
         ctx.fillText(c.model, c.x, c.y - 7.5 / zoom);
 
-        // Median Pressure
         ctx.font = `bold ${{Math.round((isSuper ? 10.5 : 9.5) / zoom)}}px sans-serif`;
         ctx.fillStyle = c.type === 'L' ? '#b91c1c' : '#1d4ed8';
         ctx.fillText(c.median_p, c.x, c.y + 0.5 / zoom);
 
-        // Member Consensus
         ctx.font = `${{Math.round((isSuper ? 7.5 : 7.0) / zoom)}}px sans-serif`;
         ctx.fillStyle = '#475569';
         ctx.fillText(`${{Math.round(c.pct)}}% (${{c.count}})`, c.x, c.y + 8.5 / zoom);
       }}
 
-      // Render suite medians first, super median on top
       ['gefs', 'aigefs', 'ifs', 'aifs', 'super'].forEach(k => {{
         if (!suiteActive[k]) return;
         if (plotMedLows && currentStepData.median_lows && currentStepData.median_lows[k]) {{
