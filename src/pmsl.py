@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import warnings
 import tempfile
 import concurrent.futures
@@ -25,10 +26,10 @@ warnings.filterwarnings('ignore')
 # 1. DOMAIN CONFIGURATION & DIRECTORIES
 # ==============================================================================
 OUTPUT_DIR = "pmsl_output"
-DATA_DIR = os.path.join(OUTPUT_DIR, "data")
-SPREAD_DIR = os.path.join(OUTPUT_DIR, "spread")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(SPREAD_DIR, exist_ok=True)
+CYCLES_DIR = os.path.join(OUTPUT_DIR, "cycles")
+MAX_ARCHIVE_CYCLES = 10  # Store 10 runs (5 days of 00z and 12z cycles)
+
+os.makedirs(CYCLES_DIR, exist_ok=True)
 
 # 0 to 240 hours every 12 hours (21 lead times)[cite: 2]
 FXX_STEPS = list(range(0, 241, 12))
@@ -102,20 +103,13 @@ def detect_latest_complete_cycle():
     return fallback_str
 
 global_init_time = detect_latest_complete_cycle()
+cycle_tag = datetime.strptime(global_init_time, '%Y-%m-%d %H:%M').strftime('%Y%m%d_%H')
 
-# ------------------------------------------------------------------------------
-# Output-Level Caching Check: Exit early if cycle is already complete
-# ------------------------------------------------------------------------------
-final_json_file = os.path.join(DATA_DIR, f"f{FXX_STEPS[-1]:03d}.json")
-if os.path.exists(final_json_file):
-    try:
-        with open(final_json_file, "r") as f:
-            last_meta = json.load(f)
-        if last_meta.get("init") == global_init_time:
-            print(f"✨ Output for cycle {global_init_time}Z is already fully built! Exiting.")
-            exit(0)
-    except Exception:
-        pass
+CURRENT_CYCLE_DIR = os.path.join(CYCLES_DIR, cycle_tag)
+DATA_DIR = os.path.join(CURRENT_CYCLE_DIR, "data")
+SPREAD_DIR = os.path.join(CURRENT_CYCLE_DIR, "spread")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(SPREAD_DIR, exist_ok=True)
 
 print("🗺️ Rendering Cartopy basemap...")
 fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -153,7 +147,7 @@ def standardize_pmsl_grid(ds):
         da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
         arr = da_interp.values
         if np.nanmean(arr) > 2000:
-            arr = arr / 100.0  # Convert Pa -> hPa
+            arr = arr / 100.0
         return arr
     except Exception:
         return None
@@ -233,17 +227,12 @@ def detect_member_centers(grid):
     return {"lows": lows, "highs": highs}
 
 def compute_90pct_peeled_hull(pts):
-    """
-    Computes a 90% peeled convex hull using Mahalanobis distance ranking.
-    Discards the outer 10% spatial outliers and bounds the 90% core.
-    """
     if len(pts) < 4:
         return None
     coords = np.array([[p["x"], p["y"]] for p in pts], dtype=float)
     try:
         mu = np.mean(coords, axis=0)
         cov = np.cov(coords, rowvar=False)
-        # Avoid singular matrix if collinear
         if np.linalg.matrix_rank(cov) < 2:
             dists = np.linalg.norm(coords - mu, axis=1)
         else:
@@ -251,7 +240,6 @@ def compute_90pct_peeled_hull(pts):
             diff = coords - mu
             dists = np.sqrt(np.sum(diff @ inv_cov * diff, axis=1))
 
-        # Keep inner 90%
         k = max(3, int(np.ceil(0.90 * len(pts))))
         keep_indices = np.argsort(dists)[:k]
         filtered_coords = coords[keep_indices]
@@ -325,7 +313,6 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
         px = int(round(fig_pt[0] * CANVAS_W))
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
 
-        # Compute 90% peeled hull polygon (Superensemble only)
         hull_polygon = compute_90pct_peeled_hull(final_pts) if model_tag == "SUPER" else None
 
         clusters.append({
@@ -432,7 +419,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None:
+            if res is not None and res.ndim == 2:
                 grids.append(res)
     return grids
 
@@ -548,7 +535,7 @@ PMSL_SPREAD_LEVELS = np.arange(1.0, 13.0, 1.0)
 SPREAD_CMAP = plt.cm.YlOrRd
 
 DIFF_LEVELS = [-10, -8, -6, -4, -2, -1, 1, 2, 4, 6, 8, 10]
-DIFF_CMAP = plt.cm.RdBu_r  # Blue: Phys Deeper (Neg), Red: AI Deeper (Pos)
+DIFF_CMAP = plt.cm.RdBu_r
 
 def compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems):
     def calc_spread(mem_list):
@@ -605,7 +592,6 @@ def render_underlay(grid, filename, levels, cmap):
 for fxx in FXX_STEPS:
     step_json_path = os.path.join(DATA_DIR, f"f{fxx:03d}.json")
     
-    # Lead-level caching: skip if step file exists and matches current init cycle
     if os.path.exists(step_json_path):
         try:
             with open(step_json_path, "r") as f:
@@ -638,13 +624,11 @@ for fxx in FXX_STEPS:
     aifs_mean   = np.mean(np.stack(aifs_mems), axis=0) if aifs_mems else None
     super_mean  = np.mean(np.stack(all_members), axis=0) if all_members else None
 
-    # Render spread underlays
     spread_diags = compute_spread_diagnostics(gefs_mems, aigefs_mems, ifs_mems, aifs_mems)
     for spr_key, spr_grid in spread_diags.items():
         if spr_grid is not None:
             render_underlay(spr_grid, f"{spr_key}_f{fxx:03d}.png", PMSL_SPREAD_LEVELS, SPREAD_CMAP)
 
-    # Render Physics vs. AI Difference Underlay: ΔP = Mean(Phys) - Mean(AI)
     phys_pool = [m for m in [gefs_mean, ifs_mean] if m is not None]
     ai_pool   = [m for m in [aigefs_mean, aifs_mean] if m is not None]
     if phys_pool and ai_pool:
@@ -668,11 +652,9 @@ for fxx in FXX_STEPS:
 
     total_mem_count = len(all_members)
 
-    # 1. Superensemble Median Clusters (with 90% Peeled Convex Hull)
     super_med_lows  = cluster_extrema_medians(all_extrema, total_mem_count, "lows", 350.0, "SUPER", "#000000")
     super_med_highs = cluster_extrema_medians(all_extrema, total_mem_count, "highs", 350.0, "SUPER", "#000000")
 
-    # 2. Individual Ensemble Suite Median Clusters
     gefs_med_lows   = cluster_extrema_medians(gefs_extrema, len(gefs_mems), "lows", 350.0, "GEFS", "#0044ff") if gefs_mems else []
     gefs_med_highs  = cluster_extrema_medians(gefs_extrema, len(gefs_mems), "highs", 350.0, "GEFS", "#0044ff") if gefs_mems else []
 
@@ -727,7 +709,35 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. FRONTEND GENERATOR (PEELED HULLS & PHYSICS VS. AI DIAGNOSTICS)
+# 8. ARCHIVE MAINTENANCE (MANIFEST & ROLLING FIFO PURGE)
+# ==============================================================================
+# Gather all available cycles in the archive directory
+available_cycles = sorted([d for d in os.listdir(CYCLES_DIR) if os.path.isdir(os.path.join(CYCLES_DIR, d))])
+
+# Prune directories older than MAX_ARCHIVE_CYCLES
+while len(available_cycles) > MAX_ARCHIVE_CYCLES:
+    oldest = available_cycles.pop(0)
+    print(f"🗑️ Pruning oldest archive cycle: {oldest}")
+    shutil.rmtree(os.path.join(CYCLES_DIR, oldest), ignore_errors=True)
+
+manifest_entries = []
+for c_tag in available_cycles:
+    # Convert tag format YYYYMMDD_HH to readable string YYYY-MM-DD HH:00Z
+    dt = datetime.strptime(c_tag, '%Y%m%d_%H')
+    manifest_entries.append({
+        "tag": c_tag,
+        "label": dt.strftime('%Y-%m-%d %HZ')
+    })
+
+manifest_path = os.path.join(OUTPUT_DIR, "manifest.json")
+with open(manifest_path, "w") as f:
+    json.dump({"cycles": manifest_entries, "latest": cycle_tag}, f, indent=2)
+
+print(f"📋 Updated archive manifest with {len(manifest_entries)} active cycles.")
+
+
+# ==============================================================================
+# 9. FRONTEND GENERATOR (CYCLE SCRUBBING & KEYBOARD NAVIGATION)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -833,7 +843,6 @@ html_content = f"""<!DOCTYPE html>
       box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
     }}
     
-    /* Dynamic Colorbars */
     .cbar-container {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
     .colorbar-spread {{
       width: 110px; height: 10px; border-radius: 2px;
@@ -845,26 +854,40 @@ html_content = f"""<!DOCTYPE html>
       background: linear-gradient(to right, #0571b0, #92c5de, #f7f7f7, #f4a582, #ca0020);
       border: 1px solid var(--border);
     }}
+    .shortcut-badge {{
+      background: #334155; padding: 1px 4px; border-radius: 3px; font-size: 10px; color: #94a3b8;
+    }}
   </style>
 </head>
 <body>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">Cycle: {global_init_time}Z | 90% Peeled Spread Hulls & Physics vs. AI Diagnostics</div>
+    <div class="subtitle">5-Day Rolling Archive | Dual-Axis Navigation (<span class="shortcut-badge">←/→</span> Lead | <span class="shortcut-badge">↑/↓</span> Cycle)</div>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Lead Scrubbing & Underlay -->
+    <!-- Row 1: Cycle Selector, Lead Scrubbing & Underlay -->
     <div class="row">
+      <!-- Cycle Selector -->
       <div style="display: flex; gap: 5px; align-items: center;">
-        <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
+        <b>Cycle:</b>
+        <button class="btn btn-secondary" onclick="stepCycle(-1)" title="Previous Older Run (↑)">▲ Older</button>
+        <select id="cycleSelect" onchange="onCycleChange()"></select>
+        <button class="btn btn-secondary" onclick="stepCycle(1)" title="Next Newer Run (↓)">▼ Newer</button>
+      </div>
+
+      <!-- Lead Selector -->
+      <div style="display: flex; gap: 5px; align-items: center;">
+        <b>Lead:</b>
+        <button class="btn btn-secondary" onclick="stepLead(-1)" title="Previous Lead (←)">◀ Prev</button>
         <select id="leadSelect" onchange="loadStepData()">
           {"".join([f'<option value="{f:03d}">F{f:03d} (+{f}h)</option>' for f in FXX_STEPS])}
         </select>
-        <button class="btn btn-secondary" onclick="step(1)">Next ▶</button>
+        <button class="btn btn-secondary" onclick="stepLead(1)" title="Next Lead (→)">Next ▶</button>
       </div>
 
+      <!-- Underlay Diagnostic -->
       <div style="display: flex; gap: 8px; align-items: center;">
         <b>Underlay:</b>
         <select id="bgSelect" onchange="updateBackground()">
@@ -878,14 +901,12 @@ html_content = f"""<!DOCTYPE html>
           <option value="aifs">AIFS Spread</option>
         </select>
 
-        <!-- Spread Colorbar -->
         <div class="cbar-container" id="cbarSpread">
           <span>1 hPa</span>
           <div class="colorbar-spread"></div>
           <span>12+ hPa</span>
         </div>
 
-        <!-- Physics vs AI Diff Colorbar -->
         <div class="cbar-container" id="cbarDiff">
           <span style="color:#60a5fa;">Phys Deeper (-10)</span>
           <div class="colorbar-diff"></div>
@@ -998,6 +1019,8 @@ html_content = f"""<!DOCTYPE html>
     const CANVAS_H = 800;
     let dataCache = {{}};
     let currentStepData = null;
+    let availableCycles = [];
+    let currentCycleTag = "";
     let underlayImg = new Image();
     underlayImg.src = 'basemap.png';
 
@@ -1057,34 +1080,59 @@ html_content = f"""<!DOCTYPE html>
       if (bg === 'none') {{
         underlayImg.src = 'basemap.png';
       }} else if (bg === 'diff') {{
-        underlayImg.src = `spread/diff_f${{fxx}}.png`;
+        underlayImg.src = `cycles/${{currentCycleTag}}/spread/diff_f${{fxx}}.png`;
         cbarDiff.style.display = 'flex';
       }} else {{
-        underlayImg.src = `spread/${{bg}}_f${{fxx}}.png`;
+        underlayImg.src = `cycles/${{currentCycleTag}}/spread/${{bg}}_f${{fxx}}.png`;
         cbarSpread.style.display = 'flex';
       }}
+    }}
+
+    async function initArchive() {{
+      try {{
+        const resp = await fetch('manifest.json');
+        const manifest = await resp.json();
+        availableCycles = manifest.cycles;
+        
+        const cycleSelect = document.getElementById('cycleSelect');
+        cycleSelect.innerHTML = availableCycles.map((c, idx) => `
+          <option value="${{c.tag}}" ${{c.tag === manifest.latest ? 'selected' : ''}}>${{c.label}}</option>
+        `).join('');
+
+        currentCycleTag = manifest.latest;
+        loadStepData();
+      }} catch (err) {{
+        console.error("Failed to load archive manifest", err);
+      }}
+    }}
+
+    function onCycleChange() {{
+      currentCycleTag = document.getElementById('cycleSelect').value;
+      dataCache = {{}}; // Clear memory cache for new cycle
+      loadStepData();
     }}
 
     async function loadStepData() {{
       const fxx = document.getElementById('leadSelect').value;
       updateBackground();
 
-      if (dataCache[fxx]) {{
-        currentStepData = dataCache[fxx];
+      const cacheKey = `${{currentCycleTag}}_${{fxx}}`;
+      if (dataCache[cacheKey]) {{
+        currentStepData = dataCache[cacheKey];
         draw();
         return;
       }}
       try {{
-        const resp = await fetch(`data/f${{fxx}}.json`);
+        const resp = await fetch(`cycles/${{currentCycleTag}}/data/f${{fxx}}.json`);
         currentStepData = await resp.json();
-        dataCache[fxx] = currentStepData;
+        dataCache[cacheKey] = currentStepData;
         draw();
       }} catch (err) {{
-        console.error("Failed loading lead F" + fxx, err);
+        console.error("Failed loading lead F" + fxx + " for cycle " + currentCycleTag, err);
       }}
     }}
 
-    function step(delta) {{
+    function stepLead(delta) {{
       const select = document.getElementById('leadSelect');
       let idx = select.selectedIndex + delta;
       if (idx >= 0 && idx < select.options.length) {{
@@ -1093,9 +1141,21 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
+    function stepCycle(delta) {{
+      const select = document.getElementById('cycleSelect');
+      let idx = select.selectedIndex + delta;
+      if (idx >= 0 && idx < select.options.length) {{
+        select.selectedIndex = idx;
+        onCycleChange();
+      }}
+    }}
+
+    // Dual-Axis Keyboard Controls: Left/Right = Lead | Up/Down = Cycle
     document.addEventListener('keydown', (e) => {{
-      if (e.key === 'ArrowLeft') step(-1);
-      if (e.key === 'ArrowRight') step(1);
+      if (e.key === 'ArrowLeft') stepLead(-1);
+      if (e.key === 'ArrowRight') stepLead(1);
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepCycle(-1); }}
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepCycle(1); }}
     }});
 
     // Pan & Zoom
@@ -1332,7 +1392,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // 90% Peeled Convex Hulls (Superensemble Uncertainty Core)
+      // 90% Peeled Convex Hulls
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
       const showHull = document.getElementById('chk_show_hull').checked;
       const plotMedLows = document.getElementById('chk_med_type_lows').checked;
@@ -1478,7 +1538,6 @@ html_content = f"""<!DOCTYPE html>
 
       ctx.restore();
 
-      // Legend Items
       document.getElementById('legendBox').innerHTML = legendItems.map(item => `
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="width:20px; height:3px; background:${{item.color}}; border-bottom:${{item.dash ? '2px dashed #000' : 'none'}}"></span>
@@ -1487,7 +1546,7 @@ html_content = f"""<!DOCTYPE html>
       `).join('');
     }}
 
-    loadStepData();
+    initArchive();
   </script>
 </body>
 </html>
