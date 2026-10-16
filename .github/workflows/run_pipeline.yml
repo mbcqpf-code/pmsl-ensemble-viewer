@@ -2,17 +2,14 @@ name: Generate and Deploy PMSL Ensembles
 
 on:
   schedule:
-    # Runs twice daily at 04:30Z and 16:30Z (allows time for 00z/12z ECMWF IFS & AIGEFS runs to complete)
     - cron: '30 4,16 * * *'
-  workflow_dispatch: # Enables manual "Run workflow" button in GitHub Actions UI
+  workflow_dispatch:
 
-# Set permissions for GitHub Pages deployment
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued
 concurrency:
   group: 'pages'
   cancel-in-progress: true
@@ -20,7 +17,7 @@ concurrency:
 jobs:
   build-pmsl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6-hour runner limit
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Code
@@ -41,6 +38,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Restore Rolling Cycle Archive
+        uses: actions/cache@v4
+        with:
+          path: pmsl_output/cycles
+          key: pmsl-cycles-${{ github.run_id }}
+          restore-keys: |
+            pmsl-cycles-
 
       - name: Run PMSL Processing Pipeline
         run: |
