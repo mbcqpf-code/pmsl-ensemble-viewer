@@ -49,7 +49,7 @@ target_lons, target_lats = np.meshgrid(grid_lons, grid_lats)
 
 
 # ==============================================================================
-# 2. CYCLE DETECTOR (MONITORING IFS & AIGEFS SFC AT F240)
+# 2. CYCLE DETECTOR (IFS & AIGEFS SFC AT F240)
 # ==============================================================================
 def detect_latest_complete_cycle():
     now = datetime.utcnow()
@@ -217,13 +217,17 @@ def detect_member_centers(grid):
             
     return {"lows": lows, "highs": highs}
 
-def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=350.0):
+def cluster_extrema_medians(member_extrema_list, total_members, center_type="lows", radius_km=350.0, model_tag="SUPER", color="#000000"):
+    """
+    Groups member centers using density-seeded radial clustering.
+    Supports both superensemble and suite-specific cluster calculation.
+    """
     all_centers = []
     for m_idx, centers in enumerate(member_extrema_list):
         for pt in centers.get(center_type, []):
             all_centers.append({**pt, "member": m_idx})
             
-    if not all_centers:
+    if not all_centers or total_members == 0:
         return []
 
     def approx_dist_km(lat1, lon1, lat2, lon2):
@@ -233,7 +237,7 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
 
     unassigned = list(all_centers)
     clusters = []
-    min_members = max(3, int(total_members * 0.10))
+    min_members = max(2, int(total_members * 0.10))
 
     while unassigned:
         best_seed = None
@@ -281,6 +285,8 @@ def cluster_extrema_medians(member_extrema_list, total_members, center_type="low
         py = int(round((1.0 - fig_pt[1]) * CANVAS_H))
 
         clusters.append({
+            "model": model_tag,
+            "color": color,
             "type": "L" if center_type == "lows" else "H",
             "x": px,
             "y": py,
@@ -590,8 +596,23 @@ for fxx in FXX_STEPS:
     }
 
     total_mem_count = len(all_members)
-    median_low_clusters  = cluster_extrema_medians(all_extrema, total_mem_count, center_type="lows", radius_km=350.0)
-    median_high_clusters = cluster_extrema_medians(all_extrema, total_mem_count, center_type="highs", radius_km=350.0)
+
+    # 1. Superensemble Median Clusters
+    super_med_lows  = cluster_extrema_medians(all_extrema, total_mem_count, "lows", 350.0, "SUPER", "#000000")
+    super_med_highs = cluster_extrema_medians(all_extrema, total_mem_count, "highs", 350.0, "SUPER", "#000000")
+
+    # 2. Individual Ensemble Suite Median Clusters
+    gefs_med_lows   = cluster_extrema_medians(gefs_extrema, len(gefs_mems), "lows", 350.0, "GEFS", "#0044ff") if gefs_mems else []
+    gefs_med_highs  = cluster_extrema_medians(gefs_extrema, len(gefs_mems), "highs", 350.0, "GEFS", "#0044ff") if gefs_mems else []
+
+    aigefs_med_lows  = cluster_extrema_medians(aigefs_extrema, len(aigefs_mems), "lows", 350.0, "AIGEFS", "#8e44ad") if aigefs_mems else []
+    aigefs_med_highs = cluster_extrema_medians(aigefs_extrema, len(aigefs_mems), "highs", 350.0, "AIGEFS", "#8e44ad") if aigefs_mems else []
+
+    ifs_med_lows    = cluster_extrema_medians(ifs_extrema, len(ifs_mems), "lows", 350.0, "IFS", "#d63031") if ifs_mems else []
+    ifs_med_highs   = cluster_extrema_medians(ifs_extrema, len(ifs_mems), "highs", 350.0, "IFS", "#d63031") if ifs_mems else []
+
+    aifs_med_lows   = cluster_extrema_medians(aifs_extrema, len(aifs_mems), "lows", 350.0, "AIFS", "#00b894") if aifs_mems else []
+    aifs_med_highs  = cluster_extrema_medians(aifs_extrema, len(aifs_mems), "highs", 350.0, "AIFS", "#00b894") if aifs_mems else []
 
     step_data = {
         "fxx": fxx,
@@ -612,8 +633,20 @@ for fxx in FXX_STEPS:
         "ifs_extrema": ifs_extrema,
         "aifs_extrema": aifs_extrema,
         "det_extrema": det_extrema,
-        "median_lows": median_low_clusters,
-        "median_highs": median_high_clusters
+        "median_lows": {
+            "super": super_med_lows,
+            "gefs": gefs_med_lows,
+            "aigefs": aigefs_med_lows,
+            "ifs": ifs_med_lows,
+            "aifs": aifs_med_lows
+        },
+        "median_highs": {
+            "super": super_med_highs,
+            "gefs": gefs_med_highs,
+            "aigefs": aigefs_med_highs,
+            "ifs": ifs_med_highs,
+            "aifs": aifs_med_highs
+        }
     }
 
     with open(os.path.join(DATA_DIR, f"f{fxx:03d}.json"), "w") as f:
@@ -623,7 +656,7 @@ plt.close(fig)
 
 
 # ==============================================================================
-# 8. FRONTEND GENERATOR (ADAPTIVE VIEWPORT SIZING & BULK GROUP CONTROLS)
+# 8. FRONTEND GENERATOR (SUITE MEDIANS & COMPACT CONTROLS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -639,8 +672,7 @@ html_content = f"""<!DOCTYPE html>
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --accent: #3b82f6;
-      /* Dynamic viewport sizing: expands to monitor while preserving 3:2 aspect ratio */
-      --map-w: min(98vw, calc((100vh - 175px) * 1.5));
+      --map-w: min(98vw, calc((100vh - 180px) * 1.5));
     }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -727,7 +759,7 @@ html_content = f"""<!DOCTYPE html>
       position: fixed; display: none; pointer-events: none; z-index: 1000;
       background: rgba(15, 23, 42, 0.96); border: 1px solid #3b82f6; color: white;
       padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 280px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
     }}
     .spread-colorbar {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
     .colorbar-gradient {{
@@ -741,11 +773,11 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">Cycle: {global_init_time}Z | Density-Seeded Medians & Synced Inspection</div>
+    <div class="subtitle">Cycle: {global_init_time}Z | Multi-Suite Medians & Interactive Synoptic Inspection</div>
   </div>
 
   <div class="toolbar">
-    <!-- Row 1: Lead Scrubbing & Spread Underlay -->
+    <!-- Row 1: Lead Scrubbing & Underlay -->
     <div class="row">
       <div style="display: flex; gap: 5px; align-items: center;">
         <button class="btn btn-secondary" onclick="step(-1)">◀ Prev</button>
@@ -774,7 +806,7 @@ html_content = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Row 2: Isobars with All/None -->
+    <!-- Row 2: Isobars -->
     <div class="panel-box">
       <div class="group-line">
         <span class="group-label">
@@ -794,7 +826,7 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_det" onchange="draw()"> AIFS Det</label>
       </div>
 
-      <!-- Row 3: Member Centers with All/None -->
+      <!-- Row 3: Member Centers -->
       <div class="group-line">
         <span class="group-label">
           Member Centers:
@@ -810,7 +842,7 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_aifs_centers" checked onchange="draw()"> AIFS</label>
       </div>
 
-      <!-- Row 4: Deterministic Centers with All/None -->
+      <!-- Row 4: Deterministic Centers -->
       <div class="group-line">
         <span class="group-label">
           Deterministic Centers:
@@ -823,18 +855,30 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_aifs" checked onchange="draw()"><span class="badge-tag" style="background:#145a32; color:#fff;">AIFS</span></label>
       </div>
 
-      <!-- Row 5: Object-Based Medians -->
-      <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 3px 8px; border-radius: 5px;">
-        <span class="group-label" style="min-width: 175px;">Ensemble Median:</span>
-        <label class="checkbox-item"><input type="checkbox" id="chk_median_lows" checked onchange="draw()"> <b>Plot Median Lows</b></label>
-        <label class="checkbox-item"><input type="checkbox" id="chk_median_highs" onchange="draw()"> <b>Plot Median Highs</b></label>
-        <span style="display: flex; align-items: center; gap: 6px; margin-left: 8px;">
+      <!-- Row 5: Ensemble Medians (Super & Individual Suites) -->
+      <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 4px 8px; border-radius: 5px;">
+        <span class="group-label">
+          Ensemble Medians:
+          <button class="btn-micro" onclick="setGroup('medians', true)">All</button>
+          <button class="btn-micro" onclick="setGroup('medians', false)">None</button>
+        </span>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_super" checked onchange="draw()"><span class="swatch" style="background:#000;"></span> Super</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_gefs" checked onchange="draw()"><span class="swatch" style="background:#0044ff;"></span> GEFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_aigefs" checked onchange="draw()"><span class="swatch" style="background:#8e44ad;"></span> AIGEFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_ifs" checked onchange="draw()"><span class="swatch" style="background:#d63031;"></span> IFS</label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_aifs" checked onchange="draw()"><span class="swatch" style="background:#00b894;"></span> AIFS</label>
+        
+        <span style="border-left: 1px solid var(--border); height: 14px; margin: 0 4px;"></span>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_type_lows" checked onchange="draw()"><span style="color:#e74c3c; font-weight:bold;">Lows</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_med_type_highs" onchange="draw()"><span style="color:#2980b9; font-weight:bold;">Highs</span></label>
+        
+        <span style="display: flex; align-items: center; gap: 5px; margin-left: 6px;">
           <span>Min Consensus:</span>
           <select id="minPctSelect" onchange="draw()">
             <option value="15">≥ 15%</option>
             <option value="20" selected>≥ 20%</option>
             <option value="30">≥ 30%</option>
-            <option value="50">≥ 50% (High Confidence)</option>
+            <option value="50">≥ 50%</option>
           </select>
         </span>
       </div>
@@ -882,7 +926,6 @@ html_content = f"""<!DOCTYPE html>
 
     underlayImg.onload = () => draw();
 
-    // Bulk Group Toggle Handler
     function setGroup(grp, state) {{
       if (grp === 'isobars') {{
         ['chk_super', 'chk_gefs_mean', 'chk_aigefs_mean', 'chk_ifs_mean', 'chk_aifs_mean',
@@ -901,6 +944,11 @@ html_content = f"""<!DOCTYPE html>
         }}
       }} else if (grp === 'det_centers') {{
         ['chk_det_gfs', 'chk_det_aigfs', 'chk_det_ifs', 'chk_det_aifs'].forEach(id => {{
+          const el = document.getElementById(id);
+          if (el) el.checked = state;
+        }});
+      }} else if (grp === 'medians') {{
+        ['chk_med_super', 'chk_med_gefs', 'chk_med_aigefs', 'chk_med_ifs', 'chk_med_aifs'].forEach(id => {{
           const el = document.getElementById(id);
           if (el) el.checked = state;
         }});
@@ -955,9 +1003,7 @@ html_content = f"""<!DOCTYPE html>
       if (e.key === 'ArrowRight') step(1);
     }});
 
-    // =========================================================================
-    // PAN & ZOOM LOGIC
-    // =========================================================================
+    // Pan & Zoom
     function clampPan() {{
       const minX = CANVAS_W * (1 - zoom);
       const minY = CANVAS_H * (1 - zoom);
@@ -1026,9 +1072,7 @@ html_content = f"""<!DOCTYPE html>
 
     window.addEventListener('mouseup', () => {{ isDragging = false; }});
 
-    // =========================================================================
-    // SYNCED CLUSTER INSPECTION TOOLTIP
-    // =========================================================================
+    // Synced Multi-Suite Hover Inspection
     function handleHoverInspection(e) {{
       if (!currentStepData) return;
       const rect = card.getBoundingClientRect();
@@ -1045,44 +1089,55 @@ html_content = f"""<!DOCTYPE html>
       const mapY = (my - panY) / zoom;
 
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
-      const showMedLows = document.getElementById('chk_median_lows').checked;
-      const showMedHighs = document.getElementById('chk_median_highs').checked;
+      const showLows = document.getElementById('chk_med_type_lows').checked;
+      const showHighs = document.getElementById('chk_med_type_highs').checked;
 
-      let closest = null;
-      let minDist = 28 / zoom;
+      const suiteActive = {{
+        super: document.getElementById('chk_med_super').checked,
+        gefs: document.getElementById('chk_med_gefs').checked,
+        aigefs: document.getElementById('chk_med_aigefs').checked,
+        ifs: document.getElementById('chk_med_ifs').checked,
+        aifs: document.getElementById('chk_med_aifs').checked
+      }};
 
       const activeClusters = [];
-      if (showMedLows && currentStepData.median_lows) {{
-        activeClusters.push(...currentStepData.median_lows);
-      }}
-      if (showMedHighs && currentStepData.median_highs) {{
-        activeClusters.push(...currentStepData.median_highs);
-      }}
-
-      activeClusters.forEach(c => {{
-        if (c.pct < minPct) return;
-        const dist = Math.hypot(c.x - mapX, c.y - mapY);
-        if (dist < minDist) {{
-          minDist = dist;
-          closest = c;
+      Object.keys(suiteActive).forEach(suiteKey => {{
+        if (!suiteActive[suiteKey]) return;
+        if (showLows && currentStepData.median_lows && currentStepData.median_lows[suiteKey]) {{
+          activeClusters.push(...currentStepData.median_lows[suiteKey]);
+        }}
+        if (showHighs && currentStepData.median_highs && currentStepData.median_highs[suiteKey]) {{
+          activeClusters.push(...currentStepData.median_highs[suiteKey]);
         }}
       }});
 
-      if (closest) {{
-        const isLow = closest.type === 'L';
-        const typeColor = isLow ? '#ef4444' : '#38bdf8';
-        tooltip.innerHTML = `
-          <div style="font-weight:bold; color:${{typeColor}}; font-size:13px; margin-bottom:4px;">
-            ${{isLow ? '▼ Ensemble Median Low' : '▲ Ensemble Median High'}}
-          </div>
-          <div><b>Median Pressure:</b> ${{closest.median_p}} hPa</div>
-          <div><b>10th–90th Spread:</b> ${{closest.p10}} – ${{closest.p90}} hPa</div>
-          <div><b>Full Member Range:</b> ${{closest.min_p}} – ${{closest.max_p}} hPa</div>
-          <div><b>Consensus:</b> ${{closest.pct}}% (${{closest.count}}/${{closest.total_members}} members)</div>
-          <div style="font-size:11px; color:#94a3b8; margin-top:4px;">
-            <b>Center:</b> ${{closest.lat.toFixed(1)}}°N, ${{Math.abs(closest.lon).toFixed(1)}}°W
-          </div>
-        `;
+      // Snapping distance
+      const nearby = activeClusters.filter(c => {{
+        if (c.pct < minPct) return false;
+        return Math.hypot(c.x - mapX, c.y - mapY) < (30 / zoom);
+      }});
+
+      if (nearby.length > 0) {{
+        let content = `<div style="font-weight:bold; font-size:12px; margin-bottom:4px; border-bottom:1px solid #334155; padding-bottom:3px;">
+          Ensemble Median Centers (${{nearby.length}})
+        </div>`;
+
+        nearby.forEach(c => {{
+          const isL = c.type === 'L';
+          content += `
+            <div style="margin-bottom:5px;">
+              <span style="color:${{c.color}}; font-weight:bold;">${{c.model}} Median ${{isL ? 'Low' : 'High'}}:</span>
+              <b>${{c.median_p}} hPa</b>
+              <div style="font-size:11px; color:#cbd5e1;">
+                Consensus: <b>${{c.pct}}%</b> (${{c.count}}/${{c.total_members}} members)<br>
+                Spread (P10–P90): ${{c.p10}} – ${{c.p90}} hPa (${{c.min_p}}–${{c.max_p}} abs)<br>
+                Loc: ${{c.lat.toFixed(1)}}°N, ${{Math.abs(c.lon).toFixed(1)}}°W
+              </div>
+            </div>
+          `;
+        }});
+
+        tooltip.innerHTML = content;
         tooltip.style.left = (e.clientX + 14) + 'px';
         tooltip.style.top = (e.clientY + 14) + 'px';
         tooltip.style.display = 'block';
@@ -1183,7 +1238,7 @@ html_content = f"""<!DOCTYPE html>
         }}
       }}
 
-      // Member Extrema
+      // Member Extrema Centers
       const showLows = document.getElementById('chk_show_lows').checked;
       const showHighs = document.getElementById('chk_show_highs').checked;
       
@@ -1249,39 +1304,63 @@ html_content = f"""<!DOCTYPE html>
         if (showHighs && extrema.highs) renderDetBadge(extrema.highs, false);
       }});
 
-      // Density-Seeded Median Badges
+      // Ensemble Medians (Super & Individual Suites)
       const minPct = parseFloat(document.getElementById('minPctSelect').value);
-      const plotMedLows = document.getElementById('chk_median_lows').checked;
-      const plotMedHighs = document.getElementById('chk_median_highs').checked;
+      const plotMedLows = document.getElementById('chk_med_type_lows').checked;
+      const plotMedHighs = document.getElementById('chk_med_type_highs').checked;
 
-      function renderClusterBadges(clusters, color) {{
-        clusters.forEach(c => {{
-          if (c.pct < minPct) return;
-          const r = 16 / zoom;
-          ctx.beginPath();
-          ctx.arc(c.x, c.y, r, 0, 2 * Math.PI);
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-          ctx.fill();
-          ctx.lineWidth = 2.5 / zoom;
-          ctx.strokeStyle = color;
-          ctx.stroke();
+      const suiteActive = {{
+        super: document.getElementById('chk_med_super').checked,
+        gefs: document.getElementById('chk_med_gefs').checked,
+        aigefs: document.getElementById('chk_med_aigefs').checked,
+        ifs: document.getElementById('chk_med_ifs').checked,
+        aifs: document.getElementById('chk_med_aifs').checked
+      }};
 
-          ctx.font = `bold ${{Math.round(11 / zoom)}}px sans-serif`;
-          ctx.fillStyle = color;
-          ctx.fillText(c.median_p, c.x, c.y - 2 / zoom);
+      function renderClusterBadge(c) {{
+        if (c.pct < minPct) return;
+        const isSuper = c.model === 'SUPER';
+        const r = (isSuper ? 18 : 15.5) / zoom;
 
-          ctx.font = `${{Math.round(8 / zoom)}}px sans-serif`;
-          ctx.fillStyle = '#333333';
-          ctx.fillText(`${{c.pct}}% (${{c.count}}/${{c.total_members}})`, c.x, c.y + 7 / zoom);
-        }});
+        // Base badge
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, r, 0, 2 * Math.PI);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+        ctx.fill();
+        ctx.lineWidth = (isSuper ? 3.0 : 2.2) / zoom;
+        ctx.strokeStyle = c.color;
+        ctx.stroke();
+
+        // Model Tag
+        ctx.font = `bold ${{Math.round((isSuper ? 7.5 : 7.0) / zoom)}}px sans-serif`;
+        ctx.fillStyle = c.color;
+        ctx.fillText(c.model, c.x, c.y - 7.5 / zoom);
+
+        // Median Pressure
+        ctx.font = `bold ${{Math.round((isSuper ? 10.5 : 9.5) / zoom)}}px sans-serif`;
+        ctx.fillStyle = c.type === 'L' ? '#b91c1c' : '#1d4ed8';
+        ctx.fillText(c.median_p, c.x, c.y + 0.5 / zoom);
+
+        // Member Consensus
+        ctx.font = `${{Math.round((isSuper ? 7.5 : 7.0) / zoom)}}px sans-serif`;
+        ctx.fillStyle = '#475569';
+        ctx.fillText(`${{Math.round(c.pct)}}% (${{c.count}})`, c.x, c.y + 8.5 / zoom);
       }}
 
-      if (plotMedLows && currentStepData.median_lows) renderClusterBadges(currentStepData.median_lows, '#c0392b');
-      if (plotMedHighs && currentStepData.median_highs) renderClusterBadges(currentStepData.median_highs, '#2471a3');
+      // Render suite medians first, super median on top
+      ['gefs', 'aigefs', 'ifs', 'aifs', 'super'].forEach(k => {{
+        if (!suiteActive[k]) return;
+        if (plotMedLows && currentStepData.median_lows && currentStepData.median_lows[k]) {{
+          currentStepData.median_lows[k].forEach(renderClusterBadge);
+        }}
+        if (plotMedHighs && currentStepData.median_highs && currentStepData.median_highs[k]) {{
+          currentStepData.median_highs[k].forEach(renderClusterBadge);
+        }}
+      }});
 
       ctx.restore();
 
-      // Dynamic Legend
+      // Legend Items
       document.getElementById('legendBox').innerHTML = legendItems.map(item => `
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="width:20px; height:3px; background:${{item.color}}; border-bottom:${{item.dash ? '2px dashed #000' : 'none'}}"></span>
