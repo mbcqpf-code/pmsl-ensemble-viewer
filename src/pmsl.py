@@ -27,7 +27,7 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 OUTPUT_DIR = "pmsl_output"
 CYCLES_DIR = os.path.join(OUTPUT_DIR, "cycles")
-MAX_ARCHIVE_CYCLES = 10  # Store 10 runs (5 days of 00z and 12z cycles)
+MAX_ARCHIVE_CYCLES = 10  # Retain 10 cycles (5 days of 00z and 12z runs)
 
 os.makedirs(CYCLES_DIR, exist_ok=True)
 
@@ -147,7 +147,7 @@ def standardize_pmsl_grid(ds):
         da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
         arr = da_interp.values
         if np.nanmean(arr) > 2000:
-            arr = arr / 100.0
+            arr = arr / 100.0  # Convert Pa -> hPa
         return arr
     except Exception:
         return None
@@ -419,7 +419,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None and res.ndim == 2:
+            if res is not None:
                 grids.append(res)
     return grids
 
@@ -711,10 +711,8 @@ plt.close(fig)
 # ==============================================================================
 # 8. ARCHIVE MAINTENANCE (MANIFEST & ROLLING FIFO PURGE)
 # ==============================================================================
-# Gather all available cycles in the archive directory
 available_cycles = sorted([d for d in os.listdir(CYCLES_DIR) if os.path.isdir(os.path.join(CYCLES_DIR, d))])
 
-# Prune directories older than MAX_ARCHIVE_CYCLES
 while len(available_cycles) > MAX_ARCHIVE_CYCLES:
     oldest = available_cycles.pop(0)
     print(f"🗑️ Pruning oldest archive cycle: {oldest}")
@@ -722,7 +720,6 @@ while len(available_cycles) > MAX_ARCHIVE_CYCLES:
 
 manifest_entries = []
 for c_tag in available_cycles:
-    # Convert tag format YYYYMMDD_HH to readable string YYYY-MM-DD HH:00Z
     dt = datetime.strptime(c_tag, '%Y%m%d_%H')
     manifest_entries.append({
         "tag": c_tag,
@@ -737,7 +734,7 @@ print(f"📋 Updated archive manifest with {len(manifest_entries)} active cycles
 
 
 # ==============================================================================
-# 9. FRONTEND GENERATOR (CYCLE SCRUBBING & KEYBOARD NAVIGATION)
+# 9. FRONTEND GENERATOR (VALID-TIME PRESERVATION & REVERSED ARROWS)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -863,7 +860,7 @@ html_content = f"""<!DOCTYPE html>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">5-Day Rolling Archive | Dual-Axis Navigation (<span class="shortcut-badge">←/→</span> Lead | <span class="shortcut-badge">↑/↓</span> Cycle)</div>
+    <div class="subtitle">5-Day Rolling Archive | Dual-Axis Navigation (<span class="shortcut-badge">←/→</span> Lead | <span class="shortcut-badge">↑ Newer / ↓ Older</span> Cycle [Valid-Time Synced])</div>
   </div>
 
   <div class="toolbar">
@@ -872,9 +869,9 @@ html_content = f"""<!DOCTYPE html>
       <!-- Cycle Selector -->
       <div style="display: flex; gap: 5px; align-items: center;">
         <b>Cycle:</b>
-        <button class="btn btn-secondary" onclick="stepCycle(-1)" title="Previous Older Run (↑)">▲ Older</button>
+        <button class="btn btn-secondary" onclick="stepCycle(-1)" title="Step to Older Run (↓)">▼ Older</button>
         <select id="cycleSelect" onchange="onCycleChange()"></select>
-        <button class="btn btn-secondary" onclick="stepCycle(1)" title="Next Newer Run (↓)">▼ Newer</button>
+        <button class="btn btn-secondary" onclick="stepCycle(1)" title="Step to Newer Run (↑)">▲ Newer</button>
       </div>
 
       <!-- Lead Selector -->
@@ -1017,6 +1014,7 @@ html_content = f"""<!DOCTYPE html>
   <script>
     const CANVAS_W = 1200;
     const CANVAS_H = 800;
+    const FXX_STEPS = {FXX_STEPS};
     let dataCache = {{}};
     let currentStepData = null;
     let availableCycles = [];
@@ -1088,14 +1086,24 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
+    function parseCycleDate(tag) {{
+      const y = parseInt(tag.substring(0, 4), 10);
+      const m = parseInt(tag.substring(4, 6), 10) - 1;
+      const d = parseInt(tag.substring(6, 8), 10);
+      const h = parseInt(tag.substring(9, 11), 10);
+      return new Date(Date.UTC(y, m, d, h, 0, 0));
+    }}
+
     async function initArchive() {{
       try {{
         const resp = await fetch('manifest.json');
         const manifest = await resp.json();
-        availableCycles = manifest.cycles;
+        
+        // Sort chronologically (oldest at index 0, newest at end)
+        availableCycles = manifest.cycles.sort((a, b) => a.tag.localeCompare(b.tag));
         
         const cycleSelect = document.getElementById('cycleSelect');
-        cycleSelect.innerHTML = availableCycles.map((c, idx) => `
+        cycleSelect.innerHTML = availableCycles.map(c => `
           <option value="${{c.tag}}" ${{c.tag === manifest.latest ? 'selected' : ''}}>${{c.label}}</option>
         `).join('');
 
@@ -1106,9 +1114,38 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    function onCycleChange() {{
-      currentCycleTag = document.getElementById('cycleSelect').value;
-      dataCache = {{}}; // Clear memory cache for new cycle
+    // Preserves the synoptic verification valid time when switching cycles
+    function onCycleChange(explicitTag = null) {{
+      const newTag = explicitTag || document.getElementById('cycleSelect').value;
+      if (!currentCycleTag || currentCycleTag === newTag) {{
+        currentCycleTag = newTag;
+        loadStepData();
+        return;
+      }}
+
+      // Calculate current verification valid time
+      const currentFxx = parseInt(document.getElementById('leadSelect').value, 10);
+      const currentInit = parseCycleDate(currentCycleTag);
+      const targetValidTime = new Date(currentInit.getTime() + currentFxx * 3600 * 1000);
+
+      // Compute required FXX in the target cycle to keep valid time pinned
+      const newInit = parseCycleDate(newTag);
+      const desiredFxxHours = Math.round((targetValidTime.getTime() - newInit.getTime()) / (3600 * 1000));
+
+      // Snap to closest available lead in FXX_STEPS
+      let bestFxx = FXX_STEPS[0];
+      let minDiff = Infinity;
+      FXX_STEPS.forEach(f => {{
+        const diff = Math.abs(f - desiredFxxHours);
+        if (diff < minDiff) {{
+          minDiff = diff;
+          bestFxx = f;
+        }}
+      }});
+
+      document.getElementById('leadSelect').value = String(bestFxx).padStart(3, '0');
+      document.getElementById('cycleSelect').value = newTag;
+      currentCycleTag = newTag;
       loadStepData();
     }}
 
@@ -1141,21 +1178,23 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    function stepCycle(delta) {{
-      const select = document.getElementById('cycleSelect');
-      let idx = select.selectedIndex + delta;
-      if (idx >= 0 && idx < select.options.length) {{
-        select.selectedIndex = idx;
-        onCycleChange();
+    // Step cycle: +1 = Newer, -1 = Older
+    function stepCycle(direction) {{
+      const sorted = [...availableCycles].sort((a, b) => a.tag.localeCompare(b.tag));
+      const currIdx = sorted.findIndex(c => c.tag === currentCycleTag);
+      if (currIdx === -1) return;
+      const nextIdx = currIdx + direction;
+      if (nextIdx >= 0 && nextIdx < sorted.length) {{
+        onCycleChange(sorted[nextIdx].tag);
       }}
     }}
 
-    // Dual-Axis Keyboard Controls: Left/Right = Lead | Up/Down = Cycle
+    // Dual-Axis Navigation: ←/→ for Lead | ↑ Newer / ↓ Older for Cycle
     document.addEventListener('keydown', (e) => {{
       if (e.key === 'ArrowLeft') stepLead(-1);
       if (e.key === 'ArrowRight') stepLead(1);
-      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepCycle(-1); }}
-      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepCycle(1); }}
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepCycle(1); }}    // Up = Newer
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepCycle(-1); }} // Down = Older
     }});
 
     // Pan & Zoom
