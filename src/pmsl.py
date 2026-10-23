@@ -419,7 +419,7 @@ def fetch_aigefs_pmsl(fxx):
     grids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(_worker, members):
-            if res is not None:
+            if res is not None and res.ndim == 2:
                 grids.append(res)
     return grids
 
@@ -734,7 +734,7 @@ print(f"📋 Updated archive manifest with {len(manifest_entries)} active cycles
 
 
 # ==============================================================================
-# 9. FRONTEND GENERATOR (VALID-TIME PRESERVATION & REVERSED ARROWS)
+# 9. FRONTEND GENERATOR (GHOST TRAILS & SUITE CONSISTENCY GAUGES)
 # ==============================================================================
 html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -836,8 +836,8 @@ html_content = f"""<!DOCTYPE html>
     .hover-tooltip {{
       position: fixed; display: none; pointer-events: none; z-index: 1000;
       background: rgba(15, 23, 42, 0.96); border: 1px solid #3b82f6; color: white;
-      padding: 8px 12px; border-radius: 6px; font-size: 12px; line-height: 1.4;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.7); max-width: 290px;
+      padding: 10px 14px; border-radius: 6px; font-size: 12px; line-height: 1.45;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.7); min-width: 290px;
     }}
     
     .cbar-container {{ display: none; align-items: center; gap: 6px; font-size: 11px; }}
@@ -854,13 +854,19 @@ html_content = f"""<!DOCTYPE html>
     .shortcut-badge {{
       background: #334155; padding: 1px 4px; border-radius: 3px; font-size: 10px; color: #94a3b8;
     }}
+    .metric-pill {{
+      display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 10.5px; margin-top: 3px;
+    }}
+    .pill-green {{ background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.5); }}
+    .pill-red {{ background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.5); }}
+    .pill-amber {{ background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.5); }}
   </style>
 </head>
 <body>
 
   <div class="header">
     <h2>PMSL Multi-Ensemble & Extrema Center Viewer</h2>
-    <div class="subtitle">5-Day Rolling Archive | Dual-Axis Navigation (<span class="shortcut-badge">←/→</span> Lead | <span class="shortcut-badge">↑ Newer / ↓ Older</span> Cycle [Valid-Time Synced])</div>
+    <div class="subtitle">Ghost Trend Trails & Suite Diagnostics (<span class="shortcut-badge">←/→</span> Lead | <span class="shortcut-badge">↑ Newer / ↓ Older</span> Cycle [Valid-Time Synced])</div>
   </div>
 
   <div class="toolbar">
@@ -961,7 +967,7 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_det_aifs" checked onchange="draw()"><span class="badge-tag" style="background:#145a32; color:#fff;">AIFS</span></label>
       </div>
 
-      <!-- Row 5: Ensemble Medians & 90% Spread Hull -->
+      <!-- Row 5: Ensemble Medians & Trend Tracers -->
       <div class="group-line" style="background: rgba(59, 130, 246, 0.08); padding: 4px 8px; border-radius: 5px;">
         <span class="group-label">
           Ensemble Medians:
@@ -978,8 +984,9 @@ html_content = f"""<!DOCTYPE html>
         <label class="checkbox-item"><input type="checkbox" id="chk_med_type_lows" checked onchange="draw()"><span style="color:#e74c3c; font-weight:bold;">Lows</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_med_type_highs" onchange="draw()"><span style="color:#2980b9; font-weight:bold;">Highs</span></label>
         <label class="checkbox-item"><input type="checkbox" id="chk_show_hull" checked onchange="draw()"> <span style="font-weight:600; color:#38bdf8;">90% Spread Hull</span></label>
+        <label class="checkbox-item"><input type="checkbox" id="chk_trend_trails" checked onchange="draw()"> <span style="font-weight:600; color:#f59e0b;">Ghost Trend Trails</span></label>
         
-        <span style="display: flex; align-items: center; gap: 5px; margin-left: 6px;">
+        <span style="display: flex; align-items: center; gap: 5px; margin-left: auto;">
           <span>Min Consensus:</span>
           <select id="minPctSelect" onchange="draw()">
             <option value="15">≥ 15%</option>
@@ -1015,10 +1022,13 @@ html_content = f"""<!DOCTYPE html>
     const CANVAS_W = 1200;
     const CANVAS_H = 800;
     const FXX_STEPS = {FXX_STEPS};
-    let dataCache = {{}};
-    let currentStepData = null;
     let availableCycles = [];
     let currentCycleTag = "";
+    
+    // Memory stores: current step data, and an array of historical step data for the same valid time
+    let currentStepData = null;
+    let currentHistoryData = []; 
+    
     let underlayImg = new Image();
     underlayImg.src = 'basemap.png';
 
@@ -1035,6 +1045,17 @@ html_content = f"""<!DOCTYPE html>
     const tooltip = document.getElementById('hoverTooltip');
 
     underlayImg.onload = () => draw();
+
+    // Haversine Distance (km)
+    function getDistKm(lat1, lon1, lat2, lon2) {{
+      const R = 6371; 
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+      return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
+    }}
 
     function setGroup(grp, state) {{
       if (grp === 'isobars') {{
@@ -1099,7 +1120,6 @@ html_content = f"""<!DOCTYPE html>
         const resp = await fetch('manifest.json');
         const manifest = await resp.json();
         
-        // Sort chronologically (oldest at index 0, newest at end)
         availableCycles = manifest.cycles.sort((a, b) => a.tag.localeCompare(b.tag));
         
         const cycleSelect = document.getElementById('cycleSelect');
@@ -1114,7 +1134,6 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Preserves the synoptic verification valid time when switching cycles
     function onCycleChange(explicitTag = null) {{
       const newTag = explicitTag || document.getElementById('cycleSelect').value;
       if (!currentCycleTag || currentCycleTag === newTag) {{
@@ -1123,16 +1142,13 @@ html_content = f"""<!DOCTYPE html>
         return;
       }}
 
-      // Calculate current verification valid time
       const currentFxx = parseInt(document.getElementById('leadSelect').value, 10);
       const currentInit = parseCycleDate(currentCycleTag);
       const targetValidTime = new Date(currentInit.getTime() + currentFxx * 3600 * 1000);
 
-      // Compute required FXX in the target cycle to keep valid time pinned
       const newInit = parseCycleDate(newTag);
       const desiredFxxHours = Math.round((targetValidTime.getTime() - newInit.getTime()) / (3600 * 1000));
 
-      // Snap to closest available lead in FXX_STEPS
       let bestFxx = FXX_STEPS[0];
       let minDiff = Infinity;
       FXX_STEPS.forEach(f => {{
@@ -1149,24 +1165,48 @@ html_content = f"""<!DOCTYPE html>
       loadStepData();
     }}
 
+    // Concurrently fetches current step + up to 3 valid-time-matched historical cycles
     async function loadStepData() {{
-      const fxx = document.getElementById('leadSelect').value;
+      const fxxStr = document.getElementById('leadSelect').value;
       updateBackground();
 
-      const cacheKey = `${{currentCycleTag}}_${{fxx}}`;
-      if (dataCache[cacheKey]) {{
-        currentStepData = dataCache[cacheKey];
-        draw();
-        return;
+      currentHistoryData = [];
+      const currentInit = parseCycleDate(currentCycleTag);
+      const currentFxx = parseInt(fxxStr, 10);
+      const targetValidTime = new Date(currentInit.getTime() + currentFxx * 3600 * 1000);
+
+      const sortedCycles = [...availableCycles].sort((a, b) => b.tag.localeCompare(a.tag)); // newest to oldest
+      const currIdx = sortedCycles.findIndex(c => c.tag === currentCycleTag);
+
+      let fetchPromises = [];
+      let fetchMeta = [];
+
+      for (let i = 0; i < Math.min(4, sortedCycles.length - currIdx); i++) {{
+        const cTag = sortedCycles[currIdx + i].tag;
+        const cInit = parseCycleDate(cTag);
+        const desiredFxxHours = Math.round((targetValidTime.getTime() - cInit.getTime()) / (3600 * 1000));
+
+        if (FXX_STEPS.includes(desiredFxxHours)) {{
+          const fStr = String(desiredFxxHours).padStart(3, '0');
+          const url = `cycles/${{cTag}}/data/f${{fStr}}.json`;
+          fetchPromises.push(fetch(url).then(r => r.ok ? r.json() : null).catch(() => null));
+          fetchMeta.push({{ tag: cTag, fxx: fStr }});
+        }}
       }}
-      try {{
-        const resp = await fetch(`cycles/${{currentCycleTag}}/data/f${{fxx}}.json`);
-        currentStepData = await resp.json();
-        dataCache[cacheKey] = currentStepData;
-        draw();
-      }} catch (err) {{
-        console.error("Failed loading lead F" + fxx + " for cycle " + currentCycleTag, err);
+
+      const results = await Promise.all(fetchPromises);
+
+      if (results[0]) {{
+        currentStepData = results[0];
+        for (let i = 1; i < results.length; i++) {{
+          if (results[i]) {{
+            currentHistoryData.push({{ tag: fetchMeta[i].tag, data: results[i] }});
+          }}
+        }}
+      }} else {{
+        currentStepData = null;
       }}
+      draw();
     }}
 
     function stepLead(delta) {{
@@ -1178,7 +1218,6 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Step cycle: +1 = Newer, -1 = Older
     function stepCycle(direction) {{
       const sorted = [...availableCycles].sort((a, b) => a.tag.localeCompare(b.tag));
       const currIdx = sorted.findIndex(c => c.tag === currentCycleTag);
@@ -1189,12 +1228,11 @@ html_content = f"""<!DOCTYPE html>
       }}
     }}
 
-    // Dual-Axis Navigation: ←/→ for Lead | ↑ Newer / ↓ Older for Cycle
     document.addEventListener('keydown', (e) => {{
       if (e.key === 'ArrowLeft') stepLead(-1);
       if (e.key === 'ArrowRight') stepLead(1);
-      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepCycle(1); }}    // Up = Newer
-      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepCycle(-1); }} // Down = Older
+      if (e.key === 'ArrowUp') {{ e.preventDefault(); stepCycle(1); }}    
+      if (e.key === 'ArrowDown') {{ e.preventDefault(); stepCycle(-1); }} 
     }});
 
     // Pan & Zoom
@@ -1266,6 +1304,60 @@ html_content = f"""<!DOCTYPE html>
 
     window.addEventListener('mouseup', () => {{ isDragging = false; }});
 
+    // =========================================================================
+    // METRIC CALCULATORS (CONVERGENCE & CONSISTENCY)
+    // =========================================================================
+    function getSuiteSpread(targetC, stepData) {{
+      if (!stepData) return null;
+      let pts = [];
+      ['gefs', 'aigefs', 'ifs', 'aifs'].forEach(s => {{
+        const arr = targetC.type === 'L' ? stepData.median_lows[s] : stepData.median_highs[s];
+        if (arr) {{
+          let closest = null, minDist = 500;
+          arr.forEach(sc => {{
+            let d = getDistKm(targetC.lat, targetC.lon, sc.lat, sc.lon);
+            if (d < minDist) {{ minDist = d; closest = sc; }}
+          }});
+          if (closest) pts.push(closest);
+        }}
+      }});
+      if (pts.length < 2) return null;
+      
+      let clat = 0, clon = 0;
+      pts.forEach(p => {{ clat += p.lat; clon += p.lon; }});
+      clat /= pts.length; clon /= pts.length;
+      
+      let avgDist = 0;
+      pts.forEach(p => {{ avgDist += getDistKm(clat, clon, p.lat, p.lon); }});
+      return Math.round(avgDist);
+    }}
+
+    function calcConsistency(c0, c1, c2) {{
+      let latMid = c1.lat * Math.PI / 180;
+      let dy1 = (c0.lat - c1.lat) * 111.0;
+      let dx1 = (c0.lon - c1.lon) * 111.0 * Math.cos(latMid);
+      
+      let dy2 = (c1.lat - c2.lat) * 111.0;
+      let dx2 = (c1.lon - c2.lon) * 111.0 * Math.cos(latMid);
+
+      let mag1 = Math.hypot(dx1, dy1);
+      let mag2 = Math.hypot(dx2, dy2);
+      
+      if (mag1 < 25 || mag2 < 25) return {{ score: 95, class: 'pill-green', text: "Stable / Stationary" }};
+
+      let dot = dx1*dx2 + dy1*dy2;
+      let cosSim = dot / (mag1 * mag2); // -1 to 1
+      
+      let dirScore = 50 * (cosSim + 1); // 0 to 100
+      let jumpPen = (mag1 + mag2) / 2 / 12; // Modest distance penalty
+      
+      let finalScore = Math.max(0, Math.min(100, Math.round(dirScore - jumpPen + 15)));
+      
+      if (finalScore < 40) return {{ score: finalScore, class: 'pill-red', text: "High Volatility (Flip-Flop)" }};
+      else if (finalScore < 75) return {{ score: finalScore, class: 'pill-amber', text: "Shifting Track" }};
+      return {{ score: finalScore, class: 'pill-green', text: "Stable Progression" }};
+    }}
+
     // Synced Multi-Suite Hover Inspection
     function handleHoverInspection(e) {{
       if (!currentStepData) return;
@@ -1311,23 +1403,73 @@ html_content = f"""<!DOCTYPE html>
       }});
 
       if (nearby.length > 0) {{
-        let content = `<div style="font-weight:bold; font-size:12px; margin-bottom:4px; border-bottom:1px solid #334155; padding-bottom:3px;">
+        let content = `<div style="font-weight:bold; font-size:12.5px; margin-bottom:6px; border-bottom:1px solid #334155; padding-bottom:4px;">
           Ensemble Median Centers (${{nearby.length}})
         </div>`;
 
         nearby.forEach(c => {{
           const isL = c.type === 'L';
           content += `
-            <div style="margin-bottom:5px;">
+            <div style="margin-bottom:8px;">
               <span style="color:${{c.color}}; font-weight:bold;">${{c.model}} Median ${{isL ? 'Low' : 'High'}}:</span>
               <b>${{c.median_p}} hPa</b>
-              <div style="font-size:11px; color:#cbd5e1;">
+              <div style="font-size:11px; color:#cbd5e1; margin-top:2px;">
                 Consensus: <b>${{c.pct}}%</b> (${{c.count}}/${{c.total_members}} members)<br>
                 Spread (P10–P90): ${{c.p10}} – ${{c.p90}} hPa (${{c.min_p}}–${{c.max_p}} abs)<br>
                 Loc: ${{c.lat.toFixed(1)}}°N, ${{Math.abs(c.lon).toFixed(1)}}°W
               </div>
-            </div>
           `;
+
+          // Inject Trend Diagnostics for Superensemble Only
+          if (c.model === 'SUPER' && currentHistoryData.length > 0) {{
+            // Suite Convergence
+            const curSpread = getSuiteSpread(c, currentStepData);
+            const p1Data = currentHistoryData[0].data;
+            const targetArr = isL ? p1Data.median_lows.super : p1Data.median_highs.super;
+            
+            let p1Cluster = null;
+            if (targetArr) {{
+              let minDist = 500;
+              targetArr.forEach(hc => {{
+                let d = getDistKm(c.lat, c.lon, hc.lat, hc.lon);
+                if (d < minDist) {{ minDist = d; p1Cluster = hc; }}
+              }});
+            }}
+
+            if (curSpread !== null) {{
+              let trendStr = "Tracking...";
+              let pClass = "pill-amber";
+              if (p1Cluster) {{
+                const prevSpread = getSuiteSpread(p1Cluster, p1Data);
+                if (prevSpread !== null) {{
+                  let dS = curSpread - prevSpread;
+                  if (dS < -15) {{ trendStr = `Converging (▼${{Math.abs(dS)}}km)`; pClass = 'pill-green'; }}
+                  else if (dS > 15) {{ trendStr = `Diverging (▲${{dS}}km)`; pClass = 'pill-red'; }}
+                  else {{ trendStr = "Steady Status"; pClass = 'pill-amber'; }}
+                }}
+              }}
+              content += `<div class="metric-pill ${{pClass}}">Suites ${{trendStr}} (${{curSpread}}km spread)</div><br>`;
+            }}
+
+            // Run-to-Run Consistency / Flip-Flop
+            if (p1Cluster && currentHistoryData.length > 1) {{
+              const p2Data = currentHistoryData[1].data;
+              const targetArr2 = isL ? p2Data.median_lows.super : p2Data.median_highs.super;
+              let p2Cluster = null;
+              if (targetArr2) {{
+                let minDist2 = 500;
+                targetArr2.forEach(hc => {{
+                  let d = getDistKm(p1Cluster.lat, p1Cluster.lon, hc.lat, hc.lon);
+                  if (d < minDist2) {{ minDist2 = d; p2Cluster = hc; }}
+                }});
+              }}
+              if (p2Cluster) {{
+                let con = calcConsistency(c, p1Cluster, p2Cluster);
+                content += `<div class="metric-pill ${{con.class}}">Trend: ${{con.text}} (Score: ${{con.score}})</div>`;
+              }}
+            }}
+          }}
+          content += `</div>`;
         }});
 
         tooltip.innerHTML = content;
@@ -1462,6 +1604,64 @@ html_content = f"""<!DOCTYPE html>
         if (plotMedHighs && currentStepData.median_highs && currentStepData.median_highs.super) {{
           currentStepData.median_highs.super.forEach(c => drawHull(c, 'rgba(59, 130, 246, 0.12)', 'rgba(37, 99, 235, 0.7)'));
         }}
+      }}
+
+      // Ghost Trend Trails (Option 1)
+      if (document.getElementById('chk_trend_trails').checked && showSuperMed) {{
+        function drawTrails(arr, type) {{
+          if (!arr) return;
+          arr.forEach(c => {{
+            if (c.pct < minPct) return;
+            let current_c = c;
+            let path = [current_c];
+            
+            for (let i = 0; i < currentHistoryData.length; i++) {{
+              let hData = currentHistoryData[i].data;
+              let targetArr = type === 'L' ? hData.median_lows.super : hData.median_highs.super;
+              if (!targetArr) break;
+              
+              let bestMatch = null;
+              let minDist = 500;
+              targetArr.forEach(hc => {{
+                let d = getDistKm(current_c.lat, current_c.lon, hc.lat, hc.lon);
+                if (d < minDist) {{ minDist = d; bestMatch = hc; }}
+              }});
+              
+              if (bestMatch) {{ path.push(bestMatch); current_c = bestMatch; }} 
+              else break;
+            }}
+
+            if (path.length > 1) {{
+              // Draw track line
+              ctx.beginPath();
+              ctx.moveTo(path[0].x, path[0].y);
+              for (let i = 1; i < path.length; i++) ctx.lineTo(path[i].x, path[i].y);
+              ctx.strokeStyle = type === 'L' ? 'rgba(239, 68, 68, 0.7)' : 'rgba(56, 189, 248, 0.7)';
+              ctx.lineWidth = 3 / zoom;
+              ctx.setLineDash([8 / zoom, 5 / zoom]);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              
+              // Draw ghost badges
+              for (let i = 1; i < path.length; i++) {{
+                let hc = path[i];
+                ctx.beginPath();
+                ctx.arc(hc.x, hc.y, 11 / zoom, 0, 2*Math.PI);
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+                ctx.fill();
+                ctx.lineWidth = 1.5 / zoom;
+                ctx.strokeStyle = type === 'L' ? 'rgba(239, 68, 68, 0.6)' : 'rgba(56, 189, 248, 0.6)';
+                ctx.stroke();
+                
+                ctx.font = `bold ${{Math.round(8 / zoom)}}px sans-serif`;
+                ctx.fillStyle = '#64748b';
+                ctx.fillText(`-${{12 * i}}h`, hc.x, hc.y + 16 / zoom);
+              }}
+            }}
+          }});
+        }}
+        if (plotMedLows) drawTrails(currentStepData.median_lows.super, 'L');
+        if (plotMedHighs) drawTrails(currentStepData.median_highs.super, 'H');
       }}
 
       // Member Extrema Centers[cite: 1]
