@@ -1,8 +1,6 @@
 name: Generate and Deploy PMSL Ensembles
 
-on:
-  schedule:
-    - cron: '30 6,8,10,18,20,22 * * *'
+on:  
   workflow_dispatch:
 
 permissions:
